@@ -23,6 +23,31 @@ ip_cache_lock = threading.RLock()
 physical_interface_lock = threading.Lock()
 physical_interface_cache: tuple[str | None, float] = (None, 0.0)
 
+# ---------------------------------------------------------------------------
+# Active egress tunnel device (hot-standby dual tunnel).
+#
+# vpngate_manager runs two OpenVPN tunnels (tun0 primary slot, tun1 standby
+# slot). The proxy layer (proxy_server) must send new upstream connections
+# through whichever tunnel currently serves traffic, so the active device
+# lives here: proxy_server already depends on vpn_utils, while importing
+# vpngate_manager would create a cycle.
+# ---------------------------------------------------------------------------
+_tun_dev_lock = threading.Lock()
+_active_tun_dev = "tun0"
+
+
+def get_active_tun_dev() -> str:
+    """Device new proxy upstream connections should bind to (tun0/tun1)."""
+    with _tun_dev_lock:
+        return _active_tun_dev
+
+
+def set_active_tun_dev(dev: str) -> None:
+    """Flip the egress device. Takes effect for subsequently opened sockets."""
+    global _active_tun_dev
+    with _tun_dev_lock:
+        _active_tun_dev = dev
+
 DATACENTER_PROVIDER_PATTERN = re.compile(
     r"(?:\b(?:cloud|colo|colocation|data[ -]?center|hosting|servers?|vps)\b|softether)",
     re.IGNORECASE,

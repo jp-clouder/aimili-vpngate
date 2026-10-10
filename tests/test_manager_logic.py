@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -105,6 +106,14 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
+        # Hot-standby dual tunnel state.
+        manager.standby_openvpn_process = None
+        manager.standby_openvpn_node_id = ""
+        manager.active_tun_dev = manager.PRIMARY_TUN_DEV
+        manager.standby_tun_dev = manager.STANDBY_TUN_DEV
+        manager.standby_building = False
+        manager.standby_cancel_event = None
+        manager.vpn_utils.set_active_tun_dev(manager.PRIMARY_TUN_DEV)
 
     def tearDown(self) -> None:
         if manager.connection_attempt_lock.locked():
@@ -482,6 +491,149 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("-", state["proxy_ip"])
         self.assertFalse(any(node.get("active") for node in manager.read_nodes()))
 
+    def test_set_state_is_write_behind_until_flush(self) -> None:
+        manager.set_state(active_node_latency="12 ms", last_check_message="hi")
+        # Visible to readers immediately (in-memory)...
+        self.assertEqual("12 ms", manager.get_state()["active_node_latency"])
+        # ...but not on disk until flush_state().
+        on_disk = (
+            json.loads(manager.STATE_FILE.read_text(encoding="utf-8"))
+            if manager.STATE_FILE.exists()
+            else {}
+        )
+        self.assertNotEqual("12 ms", on_disk.get("active_node_latency"))
+        self.assertTrue(manager.flush_state())
+        on_disk = json.loads(manager.STATE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual("12 ms", on_disk["active_node_latency"])
+        # A second flush with no changes writes nothing.
+        self.assertFalse(manager.flush_state())
+
+    def test_read_nodes_cache_invalidates_on_write(self) -> None:
+        manager.write_json(manager.NODES_FILE, self.write_nodes(2))
+        self.assertEqual(2, len(manager.read_nodes()))
+        # In-process rewrite must be visible even within the same mtime tick.
+        nodes = self.write_nodes(3)
+        manager.write_json(manager.NODES_FILE, nodes)
+        self.assertEqual(3, len(manager.read_nodes()))
+        # External modification (bumped mtime) must also invalidate the cache.
+        raw = json.loads(manager.NODES_FILE.read_text(encoding="utf-8"))
+        raw.pop()
+        manager.NODES_FILE.write_text(json.dumps(raw), encoding="utf-8")
+        future_ns = time.time_ns() + 5_000_000_000
+        os.utime(manager.NODES_FILE, ns=(future_ns, future_ns))
+        self.assertEqual(2, len(manager.read_nodes()))
+
+    def test_read_nodes_returns_isolated_copies(self) -> None:
+        manager.write_json(manager.NODES_FILE, self.write_nodes(1))
+        first = manager.read_nodes()
+        first[0]["id"] = "mutated"
+        self.assertNotEqual("mutated", manager.read_nodes()[0]["id"])
+
+    def test_ui_config_cache_returns_isolated_copies(self) -> None:
+        cfg = manager.load_ui_config()
+        cfg["port"] = 9999
+        self.assertNotEqual(9999, manager.load_ui_config()["port"])
+
+    def test_hot_failover_swaps_tunnels_instantly(self) -> None:
+        manager.write_json(manager.NODES_FILE, self.write_nodes(2))
+        primary = FakeProcess()
+        backup = FakeProcess()
+        manager.active_openvpn_process = primary
+        manager.active_openvpn_node_id = "node-0"
+        manager.standby_openvpn_process = backup
+        manager.standby_openvpn_node_id = "node-1"
+        manager.vpn_utils.set_active_tun_dev("tun0")
+
+        with mock.patch.object(manager, "ensure_standby_connection"):
+            self.assertTrue(manager.try_hot_failover("test"))
+
+        # Roles swapped: the standby now serves traffic on its own device.
+        self.assertIs(backup, manager.active_openvpn_process)
+        self.assertEqual("node-1", manager.active_openvpn_node_id)
+        self.assertIsNone(manager.standby_openvpn_process)
+        self.assertEqual("", manager.standby_openvpn_node_id)
+        self.assertEqual("tun1", manager.active_tun_dev)
+        self.assertEqual("tun0", manager.standby_tun_dev)
+        self.assertEqual("tun1", manager.vpn_utils.get_active_tun_dev())
+        self.assertTrue(primary.terminated)  # dead primary reaped
+
+        stored = {n["id"]: n for n in manager.read_nodes()}
+        self.assertTrue(stored["node-1"]["active"])
+        self.assertFalse(stored["node-1"].get("standby"))
+        self.assertFalse(stored["node-0"]["active"])
+        self.assertEqual("unavailable", stored["node-0"]["probe_status"])
+
+        state = manager.get_state()
+        self.assertEqual("node-1", state["active_openvpn_node_id"])
+        self.assertEqual("tun1", state["active_tun_dev"])
+        self.assertEqual("", state["standby_node_id"])
+        self.assertEqual("none", state["standby_status"])
+
+    def test_hot_failover_noop_without_healthy_standby(self) -> None:
+        manager.write_json(manager.NODES_FILE, self.write_nodes(1))
+        primary = FakeProcess()
+        manager.active_openvpn_process = primary
+        manager.active_openvpn_node_id = "node-0"
+        manager.standby_openvpn_process = None
+        manager.standby_openvpn_node_id = ""
+
+        with mock.patch.object(manager, "ensure_standby_connection") as ensure_mock:
+            self.assertFalse(manager.try_hot_failover("test"))
+        ensure_mock.assert_not_called()
+
+        self.assertIs(primary, manager.active_openvpn_process)
+        self.assertEqual("node-0", manager.active_openvpn_node_id)
+        self.assertEqual("tun0", manager.active_tun_dev)
+        self.assertEqual("tun0", manager.vpn_utils.get_active_tun_dev())
+
+    def test_ensure_standby_skips_when_hot_standby_disabled(self) -> None:
+        with mock.patch.object(manager, "HOT_STANDBY_ENABLED", False):
+            with mock.patch.object(manager, "connect_standby_node") as build_mock:
+                manager.ensure_standby_connection()
+        build_mock.assert_not_called()
+
+    def test_ensure_standby_picks_node_other_than_primary(self) -> None:
+        nodes = self.write_nodes(3)
+        for n in nodes:
+            n["probe_status"] = "available"
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.active_openvpn_process = FakeProcess()
+        manager.active_openvpn_node_id = "node-0"
+        picked: list[str] = []
+
+        def fake_build(node_id: str, cancel_event=None) -> bool:
+            picked.append(node_id)
+            return True
+
+        with mock.patch.object(manager, "connect_standby_node", side_effect=fake_build):
+            manager.ensure_standby_connection()
+        self.assertEqual(1, len(picked))
+        self.assertNotEqual("node-0", picked[0])
+        self.assertFalse(manager.standby_building)
+
+    def test_setup_policy_routing_uses_per_device_table(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(manager.setup_policy_routing("tun1"))
+        route_cmds = [c for c in calls if c[:3] == ["ip", "route", "add"]]
+        self.assertTrue(route_cmds)
+        self.assertIn("101", route_cmds[0])
+        self.assertIn("tun1", route_cmds[0])
+        rule_cmds = [c for c in calls if c[:3] == ["ip", "rule", "add"]]
+        self.assertTrue(rule_cmds)
+        self.assertIn("101", rule_cmds[0])
+
+        calls.clear()
+        with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(manager.setup_policy_routing("tun0"))
+        route_cmds = [c for c in calls if c[:3] == ["ip", "route", "add"]]
+        self.assertIn("100", route_cmds[0])
+
     def test_ui_auth_json_is_written_private(self) -> None:
         auth_file = manager.DATA_DIR / "ui_auth.json"
         manager.write_json(auth_file, {"username": "test", "password": "secret"})
@@ -780,7 +932,9 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('role="dialog" aria-modal="true"', manager.INDEX_HTML)
         self.assertIn('aria-label="关闭网页安全设置"', manager.INDEX_HTML)
         self.assertIn('class="option-card active" data-value="auto" aria-pressed="true"', manager.INDEX_HTML)
-        self.assertIn('class="vps-recommend-tab"', manager.INDEX_HTML)
+        self.assertNotIn('class="vps-recommend-tab"', manager.INDEX_HTML)
+        self.assertNotIn('t.me/', manager.INDEX_HTML)
+        self.assertNotIn('aff.php', manager.INDEX_HTML)
         self.assertIn('position: static;', manager.INDEX_HTML)
         self.assertIn('-webkit-overflow-scrolling: touch;', manager.INDEX_HTML)
         self.assertIn('formatUrlHost(window.location.hostname)', manager.INDEX_HTML)
@@ -837,16 +991,17 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(20, entries[0]["index"])
         self.assertEqual(519, entries[-1]["index"])
 
-    def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
+    def test_web_update_check_removed_for_private_use(self) -> None:
         self.assertEqual("2.1.5", manager.APP_VERSION)
         self.assertEqual("V2.1.5 正式版", manager.APP_VERSION_LABEL)
-        self.assertIn("检测更新", manager.INDEX_HTML)
-        self.assertIn("/api/check_update", manager.INDEX_HTML)
-        self.assertIn("/tree/main", manager.INDEX_HTML)
-        self.assertIn("/releases/latest", manager.INDEX_HTML)
-        self.assertNotIn("/tree/bate", manager.INDEX_HTML)
-        self.assertNotIn(">测试版<", manager.INDEX_HTML)
-        self.assertIn('id="deployment_mode_label"', manager.INDEX_HTML)
+        self.assertNotIn("检测更新", manager.INDEX_HTML)
+        self.assertNotIn("/api/check_update", manager.INDEX_HTML)
+        self.assertNotIn("checkForUpdate", manager.INDEX_HTML)
+        self.assertNotIn("github.com/baoweise-bot", manager.INDEX_HTML)
+        self.assertNotIn("api.github.com", manager.INDEX_HTML)
+        self.assertFalse(hasattr(manager, "check_latest_release"))
+        self.assertFalse(hasattr(manager, "GITHUB_LATEST_RELEASE_API"))
+        self.assertIn('id="github_version_label"', manager.INDEX_HTML)
 
     def test_installer_updates_only_from_main(self) -> None:
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
@@ -887,73 +1042,6 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("default: v2.1.5", workflow_text)
         self.assertIn("AimiliVPN V$(tr -d '\\r\\n' < VERSION) 正式版", workflow_text)
         self.assertNotIn("cut -d. -f1,2 VERSION", workflow_text)
-
-    def test_latest_release_check_ignores_non_version_name_text(self) -> None:
-        release = {
-            "tag_name": "v2.2.0",
-            "name": "AimiliVPN V2.2 正式版",
-            "published_at": "2026-09-01T00:00:00Z",
-            "draft": False,
-            "prerelease": False,
-        }
-        with mock.patch.object(manager, "fetch_api_text", return_value=json.dumps(release)) as fetch_mock:
-            result = manager.check_latest_release()
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["update_available"])
-        self.assertEqual("2.2.0", result["latest_version"])
-        self.assertEqual("v2.2.0", result["latest_tag"])
-        self.assertEqual(
-            "https://github.com/baoweise-bot/aimili-vpngate/releases/tag/v2.2.0",
-            result["release_url"],
-        )
-        fetch_mock.assert_called_once_with(manager.GITHUB_LATEST_RELEASE_API, True)
-
-    def test_latest_release_check_reports_current_formal_version(self) -> None:
-        release = {
-            "tag_name": "v2.1.5",
-            "name": "AimiliVPN V2.1.5 正式版",
-            "draft": False,
-            "prerelease": False,
-        }
-        with mock.patch.object(manager, "fetch_api_text", return_value=json.dumps(release)):
-            result = manager.check_latest_release()
-
-        self.assertFalse(result["update_available"])
-        self.assertEqual("V2.1.5 正式版", result["current_version_label"])
-
-    def test_latest_release_check_reports_source_update_command(self) -> None:
-        release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}
-        with (
-            mock.patch.object(manager, "fetch_api_text", return_value=json.dumps(release)),
-            mock.patch.object(manager, "DEPLOYMENT_MODE", "source"),
-            mock.patch.object(manager, "DEPLOYMENT_MODE_LABEL", "Python 源码"),
-            mock.patch.object(manager, "UPDATE_COMMAND", "ml update"),
-        ):
-            result = manager.check_latest_release()
-
-        self.assertEqual("source", result["deployment_mode"])
-        self.assertEqual("ml update", result["update_command"])
-
-    def test_latest_release_check_reports_docker_update_command(self) -> None:
-        release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}
-        with (
-            mock.patch.object(manager, "fetch_api_text", return_value=json.dumps(release)),
-            mock.patch.object(manager, "DEPLOYMENT_MODE", "docker"),
-            mock.patch.object(manager, "DEPLOYMENT_MODE_LABEL", "Docker 容器"),
-            mock.patch.object(
-                manager,
-                "UPDATE_COMMAND",
-                "docker compose pull && docker compose up -d",
-            ),
-        ):
-            result = manager.check_latest_release()
-
-        self.assertEqual("docker", result["deployment_mode"])
-        self.assertEqual(
-            "docker compose pull && docker compose up -d",
-            result["update_command"],
-        )
 
     def test_fetch_uses_github_mirror_after_official_sources(self) -> None:
         csv_text = valid_snapshot()

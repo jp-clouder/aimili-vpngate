@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import base64
 import csv
 import json
@@ -112,6 +113,10 @@ MIRROR_META_URL = os.environ.get(
 API_URL = API_HTTPS_URL
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
+# Write-behind interval for the in-memory UI state cache (see set_state).
+# state.json is rewritten from scratch on every startup, so a few seconds of
+# staleness on crash is harmless; 5s bounds it while batching hot-path writes.
+STATE_FLUSH_SECONDS = env_int("AIMILIVPN_STATE_FLUSH_SECONDS", 5, 1, 3600)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 API_FETCH_TIMEOUT_SECONDS = env_int("API_FETCH_TIMEOUT_SECONDS", 10, 1, 60)
@@ -148,10 +153,6 @@ except OSError:
     _version_text = DEFAULT_APP_VERSION
 APP_VERSION = _version_text if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", _version_text) else DEFAULT_APP_VERSION
 APP_VERSION_LABEL = f"V{APP_VERSION} 正式版"
-GITHUB_REPOSITORY = "baoweise-bot/aimili-vpngate"
-GITHUB_REPOSITORY_URL = f"https://github.com/{GITHUB_REPOSITORY}"
-GITHUB_MAIN_BRANCH_URL = f"{GITHUB_REPOSITORY_URL}/tree/main"
-GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
@@ -182,9 +183,32 @@ last_active_latency = 0
 consecutive_proxy_failures = 0
 last_proxy_failure_node_id = ""
 
+# ---------------------------------------------------------------------------
+# Hot-standby dual tunnel.
+#
+# Two OpenVPN tunnels run side by side: one serves traffic (active slot),
+# the other stays connected as a hot backup (standby slot). On active-tunnel
+# failure the slots swap instantly -- no OpenVPN handshake sits in the
+# failover path, so new proxy connections keep flowing without manual
+# intervention. The proxy layer binds new upstream sockets to whichever
+# device vpn_utils.get_active_tun_dev() reports (see proxy_server).
+# ---------------------------------------------------------------------------
+TUN_TABLES = {"tun0": 100, "tun1": 101}
+PRIMARY_TUN_DEV = "tun0"
+STANDBY_TUN_DEV = "tun1"
+HOT_STANDBY_ENABLED = env_int("AIMILIVPN_HOT_STANDBY", 1, 0, 1) == 1
+
+standby_openvpn_process: subprocess.Popen[str] | None = None
+standby_openvpn_node_id = ""
+active_tun_dev = PRIMARY_TUN_DEV
+standby_tun_dev = STANDBY_TUN_DEV
+standby_building = False
+standby_cancel_event: threading.Event | None = None
+
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
 last_pinger_heartbeat = 0.0
+last_standby_monitor_heartbeat = 0.0
 server_start_time = time.time()
 ip_enrichment_wakeup = threading.Event()
 
@@ -247,6 +271,49 @@ def upstream_proxy_auth_file() -> str | None:
         print(f"[上游代理认证] 写入认证文件失败: {exc}", flush=True)
         return None
 
+# ---------------------------------------------------------------------------
+# Hot-path caches.
+#
+# The Web UI polls get_state()/read_nodes() on every refresh and background
+# threads call set_state() every few seconds (latency pinger, handshake
+# progress, proxy health). Hitting the disk on each of those calls wastes
+# IOPS -- painful on small VPS / SD-card ARM boards -- and serializes every
+# thread on the single global lock.
+#
+#   * UI state: kept in memory, persisted write-behind every
+#     STATE_FLUSH_SECONDS (see set_state/flush_state). main() rewrites
+#     state.json from scratch on every startup, so crash staleness is harmless.
+#   * nodes.json: cached in memory, invalidated by mtime or by an in-process
+#     write counter bumped in write_json (covers same-tick rewrites).
+#   * ui_auth.json: cached in memory, invalidated by mtime. Callers receive a
+#     copy because several of them mutate-then-write-back the dict.
+#
+# Every cache is keyed on the Path object itself (plain == comparison, no
+# resolve() syscalls on the hot path), so unit tests that patch
+# DATA_DIR/NODES_FILE/STATE_FILE stay isolated from each other.
+# ---------------------------------------------------------------------------
+_state_cache: dict[str, Any] = {}
+_state_cache_path: Path | None = None
+_state_dirty = False
+
+_nodes_cache: list[dict[str, Any]] | None = None
+_nodes_cache_path: Path | None = None
+_nodes_cache_mtime_ns: int = -1
+_nodes_cache_version: int = -1
+_nodes_write_version = 0
+
+_ui_config_cache: dict[str, Any] | None = None
+_ui_config_cache_path: Path | None = None
+_ui_config_cache_mtime_ns: int = -1
+
+
+def _file_mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
 def write_json(path: Path, data: Any) -> None:
     with lock:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -262,6 +329,11 @@ def write_json(path: Path, data: Any) -> None:
                 path.chmod(0o600)
             except OSError:
                 pass
+        # Invalidate the nodes cache even when two writes land in the same
+        # mtime tick (atomic replace always bumps the real mtime too).
+        global _nodes_write_version
+        if path == NODES_FILE:
+            _nodes_write_version += 1
 
 def read_json(path: Path, default: Any) -> Any:
     with lock:
@@ -313,8 +385,19 @@ def normalize_discovery_countries(value: Any) -> list[str]:
     return normalized
 
 def load_ui_config() -> dict[str, Any]:
+    global _ui_config_cache, _ui_config_cache_path, _ui_config_cache_mtime_ns
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
+        # mtime cache: ui_auth.json only changes when the user saves settings
+        # in the Web UI (via write_json, which bumps mtime). Callers get a
+        # copy because several of them mutate-then-write-back the dict.
+        # (Path != comparison only; resolve() would cost syscalls per call.)
+        if (
+            _ui_config_cache is not None
+            and _ui_config_cache_path == auth_file
+            and _ui_config_cache_mtime_ns == _file_mtime_ns(auth_file)
+        ):
+            return dict(_ui_config_cache)
         config = {
             "username": "",
             "secret_path": "EJsW2EeBo9lY",
@@ -381,7 +464,10 @@ def load_ui_config() -> dict[str, Any]:
                 write_json(auth_file, config)
             except Exception:
                 pass
-                
+
+        _ui_config_cache = dict(config)
+        _ui_config_cache_path = auth_file
+        _ui_config_cache_mtime_ns = _file_mtime_ns(auth_file)
         return config
 
 def persist_discovery_countries(value: Any) -> list[str]:
@@ -478,26 +564,104 @@ def log_to_json(level: str, module: str, message: str) -> None:
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
+def _ensure_state_cache() -> None:
+    """Load state.json into memory once per path.
+
+    Called under ``lock`` by set_state()/get_state()/flush_state(). The first
+    call after startup (or after tests patch STATE_FILE) seeds the cache from
+    disk; afterwards the cache is the source of truth until flush_state().
+    """
+    global _state_cache, _state_cache_path, _state_dirty
+    # Plain Path comparison (no resolve(): that costs syscalls on every call).
+    # The path only ever changes when tests patch it, which yields a
+    # different (unequal) Path object.
+    if _state_cache_path != STATE_FILE:
+        data = read_json(STATE_FILE, {})
+        _state_cache = data if isinstance(data, dict) else {}
+        _state_cache_path = STATE_FILE
+        _state_dirty = False
+
+
 def set_state(**updates: Any) -> None:
-    # Keep the read-modify-write transaction atomic across background threads.
+    # Write-behind: touch memory only and mark dirty; the flusher thread
+    # persists every STATE_FLUSH_SECONDS. This used to do a full
+    # read-modify-write of state.json on every call (46 call sites, some on
+    # 10s timers or per-handshake-line), serializing all threads on the
+    # global lock for disk I/O.
     with lock:
-        state = get_state()
-        state.update(updates)
-        write_json(STATE_FILE, state)
+        _ensure_state_cache()
+        _state_cache.update(updates)
+        global _state_dirty
+        _state_dirty = True
+
+
+def flush_state() -> bool:
+    """Write the cached state to disk if dirty. Returns True when it wrote."""
+    with lock:
+        _ensure_state_cache()
+        global _state_dirty
+        if not _state_dirty:
+            return False
+        write_json(STATE_FILE, dict(_state_cache))
+        _state_dirty = False
+        return True
+
+
+def state_flusher_loop() -> None:
+    while True:
+        time.sleep(STATE_FLUSH_SECONDS)
+        try:
+            flush_state()
+        except Exception as exc:
+            print(f"[错误] 状态落盘失败: {exc}", flush=True)
+
 
 def read_nodes() -> list[dict[str, Any]]:
-    raw = read_json(NODES_FILE, [])
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, dict)]
+    global _nodes_cache, _nodes_cache_path, _nodes_cache_mtime_ns, _nodes_cache_version
+    with lock:
+        mtime_ns = _file_mtime_ns(NODES_FILE)
+        if (
+            _nodes_cache is None
+            or _nodes_cache_path != NODES_FILE
+            or _nodes_cache_mtime_ns != mtime_ns
+            or _nodes_cache_version != _nodes_write_version
+        ):
+            raw = read_json(NODES_FILE, [])
+            _nodes_cache = (
+                [item for item in raw if isinstance(item, dict)]
+                if isinstance(raw, list)
+                else []
+            )
+            _nodes_cache_path = NODES_FILE
+            _nodes_cache_mtime_ns = mtime_ns
+            _nodes_cache_version = _nodes_write_version
+        # Node dicts are flat (all scalar values), so a shallow copy per node
+        # keeps callers from corrupting the cache via top-level assignment.
+        return [dict(node) for node in _nodes_cache]
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
-    state = read_json(STATE_FILE, {})
+    # Serve from the in-memory cache: no disk I/O on the Web-UI hot path.
+    # The copy keeps the overlay mutations below from touching the cache.
+    with lock:
+        _ensure_state_cache()
+        state = dict(_state_cache)
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
     state["maintenance_running"] = maintenance_lock.locked()
+    # Hot-standby dual tunnel status, derived from live globals so the UI
+    # never shows a stale standby state.
+    state["hot_standby_enabled"] = HOT_STANDBY_ENABLED
+    state["active_tun_dev"] = active_tun_dev
+    state["standby_tun_dev"] = standby_tun_dev
+    state["standby_node_id"] = standby_openvpn_node_id
+    if standby_healthy():
+        state["standby_status"] = "ready"
+    elif standby_building:
+        state["standby_status"] = "building"
+    else:
+        state["standby_status"] = "none"
     state.setdefault("api_url", API_URL)
     state.setdefault("mirror_url", MIRROR_HTTPS_URL)
     state.setdefault("last_fetch_source", "")
@@ -847,40 +1011,6 @@ def fetch_api_text_with_deadline(
     if ok:
         return str(value)
     raise value
-
-def parse_release_version(value: Any) -> tuple[int, int, int]:
-    match = re.search(r"(?i)(?:^|[^a-z0-9])v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(value or "").strip())
-    if not match:
-        raise ValueError("GitHub Release 版本号格式无效")
-    return tuple(int(part or 0) for part in match.groups())
-
-def check_latest_release() -> dict[str, Any]:
-    payload = json.loads(fetch_api_text(GITHUB_LATEST_RELEASE_API, True))
-    if not isinstance(payload, dict):
-        raise ValueError("GitHub Release API 返回格式无效")
-    if payload.get("draft") or payload.get("prerelease"):
-        raise ValueError("GitHub 最新版本不是正式版")
-
-    latest_tag = str(payload.get("tag_name") or "").strip()
-    latest_version = parse_release_version(latest_tag)
-    current_version = parse_release_version(APP_VERSION)
-    release_url = f"{GITHUB_REPOSITORY_URL}/releases/tag/{urllib.parse.quote(latest_tag, safe='')}"
-
-    return {
-        "ok": True,
-        "current_version": APP_VERSION,
-        "current_version_label": APP_VERSION_LABEL,
-        "latest_version": ".".join(str(part) for part in latest_version),
-        "latest_tag": latest_tag,
-        "latest_name": str(payload.get("name") or latest_tag),
-        "published_at": str(payload.get("published_at") or ""),
-        "update_available": latest_version > current_version,
-        "release_url": release_url,
-        "main_branch_url": GITHUB_MAIN_BRANCH_URL,
-        "deployment_mode": DEPLOYMENT_MODE,
-        "deployment_mode_label": DEPLOYMENT_MODE_LABEL,
-        "update_command": UPDATE_COMMAND,
-    }
 
 def is_certificate_verification_error(exc: BaseException) -> bool:
     import ssl
@@ -1424,6 +1554,7 @@ def run_openvpn_until_ready(
     dev: str = "tun0",
     cancel_event: threading.Event | None = None,
     track_pending: bool = False,
+    quiet: bool = False,
 ) -> tuple[bool, str, subprocess.Popen[str] | None]:
     global pending_openvpn_process
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
@@ -1461,7 +1592,7 @@ def run_openvpn_until_ready(
                 openvpn_logs.append(line_str)
                 lines.put(line_str)
             else:
-                if keep_alive:
+                if keep_alive and not quiet:
                     print(f"[OpenVPN] {line_str}", flush=True)
                     level = "INFO"
                     line_lower = line_str.lower()
@@ -1495,10 +1626,10 @@ def run_openvpn_until_ready(
         if line:
             tail.append(line)
             tail = tail[-50:]
-            if keep_alive:
+            if keep_alive and not quiet:
                 print(f"[OpenVPN] {line}", flush=True)
         lower = line.lower()
-        if keep_alive:
+        if keep_alive and not quiet:
             update_handshake_status(lower)
         if "initialization sequence completed" in lower:
             if cancel_event is not None and cancel_event.is_set():
@@ -1541,21 +1672,31 @@ def run_openvpn_until_ready(
     return ok, message, process
 
 
+def tun_table(interface: str) -> int:
+    """Policy routing table for a tunnel device (tun0 -> 100, tun1 -> 101)."""
+    return TUN_TABLES.get(interface, 100)
+
+
 def setup_policy_routing(interface: str = "tun0") -> bool:
+    # One routing table per tunnel device. Sockets bound via SO_BINDTODEVICE
+    # match the `oif <dev>` rule and use that device's table, so both tunnels
+    # stay routable simultaneously -- a failover then only flips which device
+    # new proxy sockets bind to, with no routing changes in the hot path.
+    table = str(tun_table(interface))
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "rule", "del", "table", table], capture_output=True, timeout=2)
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", table], capture_output=True, timeout=2)
     except Exception:
         pass
-    
+
     success = False
     for attempt in range(1, 4):
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", table], check=True, timeout=2)
+            subprocess.run(["ip", "rule", "add", "oif", interface, "table", table], check=True, timeout=2)
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
                 try:
@@ -1570,20 +1711,30 @@ def setup_policy_routing(interface: str = "tun0") -> bool:
             time.sleep(1)
             
     if not success:
-        print("[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
-        log_to_json("ERROR", "Routing", "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由")
+        print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {table} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
+        log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {table} 添加默认路由")
     return success
 
 def cleanup_policy_routing() -> None:
-    try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
-    except Exception:
-        pass
+    for table in sorted(set(TUN_TABLES.values())):
+        table = str(table)
+        try:
+            subprocess.run(["ip", "rule", "del", "table", table], capture_output=True, timeout=2)
+            subprocess.run(["ip", "route", "flush", "table", table], capture_output=True, timeout=2)
+        except Exception:
+            pass
+    print("[policy_routing] Cleared policy routing tables 100/101", flush=True)
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
+    global active_tun_dev, standby_tun_dev, standby_cancel_event
+    # Cancel any in-flight standby build first so it cannot resurrect afterwards.
+    with lock:
+        cancel_event = standby_cancel_event
+        standby_cancel_event = None
+    if cancel_event is not None:
+        cancel_event.set()
+    stop_standby_openvpn()
     with lock:
         cleanup_policy_routing()
         config_to_delete = None
@@ -1592,11 +1743,15 @@ def stop_active_openvpn() -> None:
             node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
             if node:
                 config_to_delete = node.get("config_file")
-                
+
         stop_process(active_openvpn_process)
         active_openvpn_process = None
         active_openvpn_node_id = ""
-        
+        # Reset tunnel roles to their defaults.
+        active_tun_dev = PRIMARY_TUN_DEV
+        standby_tun_dev = STANDBY_TUN_DEV
+        vpn_utils.set_active_tun_dev(active_tun_dev)
+
         if config_to_delete:
             try:
                 path = Path(config_to_delete)
@@ -1607,6 +1762,292 @@ def stop_active_openvpn() -> None:
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
+
+def standby_healthy() -> bool:
+    """True when the hot-standby tunnel process is alive and bound to a node."""
+    with lock:
+        return (
+            standby_openvpn_process is not None
+            and standby_openvpn_process.poll() is None
+            and bool(standby_openvpn_node_id)
+        )
+
+def check_tunnel_health(dev: str, timeout: int = 8) -> bool:
+    """Egress check for one specific tunnel device (used for the standby).
+
+    Unlike check_proxy_health() (which tests the serving path through the
+    local proxy), this binds directly to ``dev`` so each tunnel is verified
+    independently. Requires the per-device policy routing table.
+    """
+    if sys.platform.startswith("linux") and not Path(f"/sys/class/net/{dev}").exists():
+        return False
+    for url in ("http://ip.sb", "http://api.ipify.org"):
+        try:
+            res = subprocess.run(
+                ["curl", "-s", "--interface", dev, "--max-time", str(timeout), url],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 2,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return True
+        except Exception:
+            pass
+    return False
+
+def stop_standby_openvpn() -> None:
+    """Stop only the standby tunnel; the primary keeps serving traffic."""
+    global standby_openvpn_process, standby_openvpn_node_id
+    with lock:
+        process = standby_openvpn_process
+        node_id = standby_openvpn_node_id
+        standby_openvpn_process = None
+        standby_openvpn_node_id = ""
+        config_to_delete = None
+        if node_id:
+            try:
+                nodes = read_nodes()
+                for item in nodes:
+                    if item.get("id") == node_id:
+                        config_to_delete = item.get("config_file")
+                        item["standby"] = False
+                write_json(NODES_FILE, nodes)
+            except Exception:
+                pass
+    stop_process(process)
+    if config_to_delete:
+        try:
+            path = Path(config_to_delete)
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+    set_state(standby_node_id="", last_check_message="热备隧道已停止")
+
+def connect_standby_node(node_id: str, cancel_event: threading.Event | None = None) -> bool:
+    """Build the hot-standby tunnel on ``standby_tun_dev``.
+
+    Runs in a background thread and never touches the primary tunnel or its
+    UI status: no handshake spam, no readiness flags. Returns True when the
+    standby tunnel is up and its egress verified.
+    """
+    global standby_openvpn_process, standby_openvpn_node_id
+    node_id = str(node_id or "").strip()
+    if not node_id or not HOT_STANDBY_ENABLED:
+        return False
+    try:
+        nodes = read_nodes()
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            return False
+        with lock:
+            if node_id == active_openvpn_node_id:
+                return False  # never shadow the serving tunnel
+        ui_cfg = load_ui_config()
+        try:
+            validate_node_allowed_by_routing(node, ui_cfg)
+        except Exception:
+            return False
+
+        config_path = Path(node["config_file"])
+        try:
+            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+        except Exception as e:
+            print(f"[热备] 写入热备节点配置失败: {e}", flush=True)
+            return False
+
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        ok, message, process = run_openvpn_until_ready(
+            str(config_path),
+            keep_alive=True,
+            route_nopull=True,
+            timeout=OPENVPN_TEST_TIMEOUT_SECONDS,
+            dev=standby_tun_dev,
+            cancel_event=cancel_event,
+            track_pending=False,
+            quiet=True,
+        )
+        if not ok or process is None:
+            print(f"[热备] 热备隧道建立失败 ({node_id}): {message}", flush=True)
+            log_to_json("WARNING", "VPN", f"热备隧道建立失败 ({node_id}): {message}")
+            try:
+                if config_path.exists():
+                    config_path.unlink()
+            except Exception:
+                pass
+            return False
+
+        if not setup_policy_routing(standby_tun_dev):
+            stop_process(process)
+            return False
+
+        if not check_tunnel_health(standby_tun_dev):
+            print(f"[热备] 热备隧道 {standby_tun_dev} 建连成功但出口检测失败，已放弃", flush=True)
+            log_to_json("WARNING", "VPN", f"热备隧道 {standby_tun_dev} 出口检测失败，已放弃")
+            stop_process(process)
+            return False
+
+        with lock:
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            primary_gone = not active_openvpn_running()
+            race_lost = standby_healthy()
+        if cancelled or primary_gone:
+            # Manual disconnect/switch tore the primary down while we were
+            # building: don't orphan a standby with no primary to back up.
+            stop_process(process)
+            return False
+        if race_lost:
+            # A newer standby won the race; keep the first healthy one.
+            stop_process(process)
+            return True
+        with lock:
+            standby_openvpn_process = process
+            standby_openvpn_node_id = node_id
+            current_nodes = read_nodes()
+            for item in current_nodes:
+                item["standby"] = item.get("id") == node_id
+            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+        set_state(last_check_message=f"热备隧道就绪: {node_id} ({standby_tun_dev})")
+        print(f"[热备] 热备隧道就绪: {node_id} via {standby_tun_dev}", flush=True)
+        log_to_json("INFO", "VPN", f"热备隧道就绪: {node_id} ({standby_tun_dev})")
+        return True
+    except Exception as exc:
+        print(f"[热备] 热备构建异常: {exc}", flush=True)
+        return False
+
+def ensure_standby_connection() -> None:
+    """Background supervisor: keep exactly one healthy hot-standby tunnel.
+
+    Best-effort and idempotent: returns immediately when hot standby is
+    disabled, a build is already running, a manual connection is in progress,
+    or a healthy standby already exists.
+    """
+    global standby_building, standby_cancel_event
+    global standby_openvpn_process, standby_openvpn_node_id
+    if not HOT_STANDBY_ENABLED:
+        return
+    with lock:
+        if standby_building or is_connecting or not active_openvpn_running():
+            return
+        if standby_healthy():
+            return
+        standby_building = True
+        standby_cancel_event = threading.Event()
+        cancel_event = standby_cancel_event
+    try:
+        ui_cfg = load_ui_config()
+        if not ui_cfg.get("connection_enabled", True):
+            return
+        if ui_cfg.get("routing_mode", "auto") == "fixed_ip":
+            return  # fixed-IP mode pins one egress IP; no hot standby
+        # Drop a dead standby process before rebuilding (keep our cancel event).
+        with lock:
+            dead = standby_openvpn_process
+            standby_openvpn_process = None
+            standby_openvpn_node_id = ""
+        stop_process(dead)
+        with lock:
+            nodes = read_nodes()
+            primary_id = active_openvpn_node_id
+            candidates = [
+                n for n in nodes
+                if n.get("probe_status") == "available"
+                and n.get("id") != primary_id
+                and not n.get("active")
+                and not n.get("standby")
+            ]
+            candidates = apply_routing_filters(candidates, ui_cfg)
+            candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+        if not candidates:
+            print("[热备] 没有可用的热备候选节点，稍后重试", flush=True)
+            return
+        node_id = candidates[0]["id"]
+        set_state(last_check_message=f"正在建立热备隧道: {node_id} ...")
+        print(f"[热备] 开始建立热备隧道: {node_id} via {standby_tun_dev}", flush=True)
+        connect_standby_node(node_id, cancel_event)
+    finally:
+        with lock:
+            standby_building = False
+
+def try_hot_failover(reason: str) -> bool:
+    """Swap the hot-standby tunnel into the active slot. Returns True on success.
+
+    The flip itself is instant -- no OpenVPN handshake in the critical path:
+    proxy upstream sockets bind to the new active device from this point on,
+    so new connections keep flowing with no manual intervention. A fresh
+    standby is rebuilt in the background afterwards.
+    """
+    global active_openvpn_process, active_openvpn_node_id
+    global standby_openvpn_process, standby_openvpn_node_id
+    global active_tun_dev, standby_tun_dev
+    if not HOT_STANDBY_ENABLED:
+        return False
+    with lock:
+        if not standby_healthy():
+            return False
+        dead_process = active_openvpn_process
+        dead_node_id = active_openvpn_node_id
+        dead_config = None
+        try:
+            nodes = read_nodes()
+            dead_node = next((item for item in nodes if item.get("id") == dead_node_id), None)
+            if dead_node:
+                dead_config = dead_node.get("config_file")
+        except Exception:
+            pass
+        # Swap roles: the standby becomes the serving tunnel.
+        active_openvpn_process, standby_openvpn_process = standby_openvpn_process, None
+        active_openvpn_node_id, standby_openvpn_node_id = standby_openvpn_node_id, ""
+        active_tun_dev, standby_tun_dev = standby_tun_dev, active_tun_dev
+        vpn_utils.set_active_tun_dev(active_tun_dev)
+        new_node_id = active_openvpn_node_id
+        new_dev = active_tun_dev
+    # Outside the lock: stop the dead primary and update persistent flags.
+    stop_process(dead_process)
+    if dead_config:
+        try:
+            path = Path(dead_config)
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+    try:
+        with lock:
+            current_nodes = read_nodes()
+            for item in current_nodes:
+                if item.get("id") == new_node_id:
+                    item["active"] = True
+                    item["standby"] = False
+                    item["probe_status"] = "available"
+                    item["probed_at"] = time.time()
+                elif item.get("id") == dead_node_id:
+                    item["active"] = False
+                    item["standby"] = False
+                    item["probe_status"] = "unavailable"
+                    item["probed_at"] = time.time()
+                else:
+                    item["standby"] = False
+            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+    except Exception:
+        pass
+    msg = f"主隧道故障({reason})，已无感切换至热备隧道: {new_node_id} ({new_dev})"
+    print(f"[热备切换] {msg}", flush=True)
+    log_to_json("WARNING", "VPN", f"[热备切换] {msg}")
+    set_state(
+        active_openvpn_node_id=new_node_id,
+        is_connecting=False,
+        pending_node_id="",
+        tunnel_ready=True,
+        proxy_ready=True,
+        proxy_ok=True,
+        last_check_message=msg,
+        active_node_latency="热备切换完成",
+    )
+    reset_proxy_failure_counter(new_node_id)
+    threading.Thread(target=ensure_standby_connection, name="vpngate-standby-rebuild", daemon=True).start()
+    return True
 
 def connection_ready_for_ui(state: dict[str, Any] | None = None) -> bool:
     current = get_state() if state is None else state
@@ -1813,6 +2254,7 @@ def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str =
             nodes = read_nodes()
             for item in nodes:
                 item["active"] = False
+                item["standby"] = False
             write_json(NODES_FILE, nodes)
         set_state(
             active_openvpn_node_id="",
@@ -2143,9 +2585,10 @@ def auto_switch_node(attempt: int = 0) -> None:
     with lock:
         nodes = read_nodes()
         candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
+            n for n in nodes
+            if n.get("probe_status") == "available"
             and not n.get("active")
+            and not n.get("standby")
         ]
         candidates = apply_routing_filters(candidates, ui_cfg)
             
@@ -2174,6 +2617,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             nodes = read_nodes()
             for item in nodes:
                 item["active"] = False
+                item["standby"] = False
             write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id="", last_check_message=msg)
         if schedule_background_refill():
@@ -2291,6 +2735,7 @@ def connect_node(node_id: str) -> str:
             str(config_path),
             keep_alive=True,
             route_nopull=True,
+            dev=active_tun_dev,
             cancel_event=cancel_event,
             track_pending=True,
         )
@@ -2321,7 +2766,7 @@ def connect_node(node_id: str) -> str:
         set_state(tunnel_ready=True, proxy_ready=False)
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        routing_ready = setup_policy_routing("tun0")
+        routing_ready = setup_policy_routing(active_tun_dev)
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
         
@@ -2382,8 +2827,11 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=res["latency_ms"],
                 proxy_error="",
             )
-        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 {active_tun_dev} 已启用")
         cancel_background_refill()
+        if HOT_STANDBY_ENABLED:
+            # The primary tunnel is up: build the hot backup in the background.
+            threading.Thread(target=ensure_standby_connection, name="vpngate-standby-build", daemon=True).start()
         return f"Connected {node_id}"
     except ConnectionCancelled:
         if stopped_existing:
@@ -2440,7 +2888,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
-                        auto_switch_node()
+                        if not try_hot_failover("维护线程检测到 OpenVPN 进程意外退出"):
+                            auto_switch_node()
                         is_connecting = True
 
         try:
@@ -3055,7 +3504,7 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
     }
 
-    button, .btn-telegram {
+    button {
       height: 38px;
       border: 1px solid var(--border-color);
       border-radius: 8px;
@@ -3078,19 +3527,6 @@ INDEX_HTML = r"""<!doctype html>
     button:hover {
       background: rgba(255, 255, 255, 0.08);
       border-color: rgba(255, 255, 255, 0.15);
-      transform: translateY(-1px);
-    }
-
-    .btn-telegram {
-      background: rgba(43, 162, 223, 0.15);
-      border: 1px solid rgba(43, 162, 223, 0.3);
-      color: #2ba2df;
-    }
-
-    .btn-telegram:hover {
-      background: rgba(43, 162, 223, 0.25);
-      border-color: rgba(43, 162, 223, 0.5);
-      color: #2ba2df;
       transform: translateY(-1px);
     }
 
@@ -3290,40 +3726,6 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 320px;
       margin-bottom: 0 !important;
     }
-    .vps-recommend-tab {
-      position: fixed;
-      right: 0;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 38px;
-      height: auto;
-      min-height: 150px;
-      background: var(--primary-gradient);
-      border: 1px solid var(--border-color-hover);
-      border-right: none;
-      border-radius: 8px 0 0 8px;
-      padding: 16px 6px;
-      color: white;
-      font-weight: 700;
-      font-size: 13px;
-      line-height: 1.4;
-      text-align: center;
-      cursor: pointer;
-      z-index: 999;
-      box-shadow: -4px 0 20px rgba(99, 102, 241, 0.3);
-      transition: all 0.3s ease;
-      writing-mode: vertical-rl;
-      text-orientation: mixed;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-    }
-    .vps-recommend-tab:hover {
-      padding-right: 10px;
-      box-shadow: -4px 0 25px rgba(99, 102, 241, 0.5);
-    }
-
     .vps-links {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
@@ -3880,7 +4282,6 @@ INDEX_HTML = r"""<!doctype html>
         flex-wrap: wrap;
       }
       .btn-group > button,
-      .btn-group > .btn-telegram,
       .btn-group > .dropdown {
         flex: 1 1 calc(50% - 4px);
         min-width: 0;
@@ -3891,12 +4292,6 @@ INDEX_HTML = r"""<!doctype html>
       .btn-group .dropdown button {
         width: 100%;
         flex: 1;
-      }
-      #github_dropdown {
-        left: 0;
-        right: auto;
-        width: min(280px, calc(100vw - 40px));
-        min-width: 0;
       }
       main {
         padding: 16px 20px;
@@ -3909,7 +4304,7 @@ INDEX_HTML = r"""<!doctype html>
       .active-card button {
         width: 100%;
       }
-      button, .btn-telegram {
+      button {
         min-height: 44px;
       }
       .input-field,
@@ -3967,50 +4362,11 @@ INDEX_HTML = r"""<!doctype html>
       opacity: 0.55;
       cursor: wait;
     }
-    .github-dropdown {
-      min-width: 250px;
-      padding: 6px;
-    }
-    .version-current {
-      padding: 9px 10px 10px;
-      margin-bottom: 4px;
-      border-bottom: 1px solid var(--border-color);
-    }
-    .version-current-label {
-      color: var(--text-primary);
+    .version-static {
+      color: var(--text-secondary);
       font-size: 13px;
-      font-weight: 700;
-    }
-    .version-current-meta {
-      margin-top: 3px;
-      color: var(--text-secondary);
-      font-size: 11px;
-    }
-    .update-check-status {
-      min-height: 34px;
-      margin: 6px 6px 0;
-      padding: 8px 10px;
-      border: 1px solid var(--border-color);
-      border-radius: 6px;
-      color: var(--text-secondary);
-      font-size: 12px;
-      line-height: 1.45;
-      overflow-wrap: anywhere;
-    }
-    .update-check-status.available {
-      border-color: rgba(245, 158, 11, 0.35);
-      color: #fbbf24;
-      background: rgba(245, 158, 11, 0.08);
-    }
-    .update-check-status.current {
-      border-color: rgba(16, 185, 129, 0.3);
-      color: #34d399;
-      background: rgba(16, 185, 129, 0.08);
-    }
-    .update-check-status.error {
-      border-color: rgba(244, 63, 94, 0.3);
-      color: #fb7185;
-      background: rgba(244, 63, 94, 0.08);
+      font-weight: 600;
+      white-space: nowrap;
     }
     
     /* Modal styles */
@@ -4164,30 +4520,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div class="btn-group">
 
-    <div class="dropdown">
-      <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V2.1.5 正式版</span>
-        <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
-      </button>
-      <div id="github_dropdown" class="dropdown-content github-dropdown">
-        <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V2.1.5 正式版</div>
-          <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
-        </div>
-        <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
-          <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
-          检测更新
-        </button>
-        <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
-        <a id="latest_release_link" href="https://github.com/baoweise-bot/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
-        <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
-      </div>
-    </div>
-    <a href="https://t.me/arestemple" target="_blank" rel="noopener noreferrer" class="btn-telegram">
-      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
-      Telegram
-    </a>
+    <span id="github_version_label" class="version-static">V2.1.5 正式版</span>
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
@@ -4459,51 +4792,6 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
 
-  <!-- VPS 购买推荐 Modal -->
-  <div id="vps_recommend_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="vps_modal_title" aria-hidden="true">
-    <div class="modal-content" tabindex="-1" style="max-width: 640px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-        <h3 id="vps_modal_title" style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--warning);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364.364l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
-          VPS 购买推荐
-        </h3>
-        <button type="button" aria-label="关闭 VPS 推荐" onclick="closeVpsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-      
-      <div class="vps-links">
-        <div class="vps-item">
-          <span class="vps-tag tag-normal">RNVPS (RackNerd) 推荐</span>
-          <span class="vps-desc">超低折扣价格，性价比极高，日常使用实惠方便，海外多机房可选，非常适合普通大众用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" rel="noopener noreferrer" class="vps-btn">点击进入官网</a>
-        </div>
-        <div class="vps-item">
-          <span class="vps-tag tag-premium">搬瓦工 (Bandwagon) 推荐</span>
-          <span class="vps-desc">直连三网顶级专线，经典高带宽 CN2 GIA/9929 优化线路，极致速度且超凡稳定，高端用户首选。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" rel="noopener noreferrer" class="vps-btn">点击进入官网</a>
-        </div>
-      </div>
-      
-      <div class="vps-footer" style="margin-top: 20px;">
-        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" rel="noopener noreferrer" class="forum-link">339936.xyz</a>
-      </div>
-
-      <div class="vps-footer" style="margin-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px; text-align: left; font-size: 13px; color: var(--text-secondary); line-height: 1.6;">
-        <div style="font-weight: bold; color: var(--text-primary); margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          🎁 捐赠支持项目开发：
-        </div>
-        <div style="font-family: monospace; background: rgba(0,0,0,0.2); padding: 8px 12px; border-radius: 6px; margin-top: 6px; word-break: break-all; select-all: true;">
-          <span style="color: var(--primary); font-weight: bold;">BNB (BSC):</span> 0xB6d78c42CEB0687A31B8cfEBE4b51b6eB8953C17<br>
-          <span style="color: var(--primary); font-weight: bold;">TRX (TRC20):</span> TSdzCW6JvsrqcppodYjhSrku4mYmDJ9pxf
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <button type="button" class="vps-recommend-tab" onclick="openVpsModal()">VPS购买推荐</button>
-
   <!-- Gateway Modal (网关自检与代理测试) -->
   <div id="gateway_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="gateway_modal_title" aria-hidden="true">
     <div class="modal-content" tabindex="-1" style="max-width: 600px; width: 90%;">
@@ -4686,7 +4974,6 @@ function hideModal(id) {
 function closeActiveModal() {
   if (activeModalId === "credentials_modal") closeCredentialsModal();
   else if (activeModalId === "network_modal") closeNetworkModal();
-  else if (activeModalId === "vps_recommend_modal") closeVpsModal();
   else if (activeModalId === "gateway_modal") closeGatewayModal();
   else if (activeModalId === "logs_modal") closeLogsModal();
 }
@@ -5097,8 +5384,19 @@ function render(){
   
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
+  const standbyNode = nodes.find(n => n && n.standby);
+  let standbyInfo;
+  if (!state.hot_standby_enabled) {
+    standbyInfo = `<span class="badge not_checked" style="margin-left:8px; padding:2px 8px;">未启用</span>`;
+  } else if (standbyNode) {
+    standbyInfo = `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(standbyNode.country))} (${esc(standbyNode.id)})</span>`;
+  } else if (state.standby_status === "building") {
+    standbyInfo = `<span class="badge" style="margin-left:8px; padding:2px 8px;">建立中…</span>`;
+  } else {
+    standbyInfo = `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
+  }
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
-  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`; }
+  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 热备：${standbyInfo} | 状态：${esc(statusMessage)}`; }
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -5572,44 +5870,6 @@ $("btn_test_proxy").onclick = async () => {
 // Admin dropdown toggle & GitHub dropdown toggle
 const adminBtn = $("admin_btn");
 const adminDropdown = $("admin_dropdown");
-const githubBtn = $("github_btn");
-const githubDropdown = $("github_dropdown");
-
-async function checkForUpdate(event) {
-  if (event) event.stopPropagation();
-  const button = $("check_update_btn");
-  const statusBox = $("update_check_status");
-  const releaseLink = $("latest_release_link");
-  if (!button || !statusBox) return;
-
-  button.disabled = true;
-  statusBox.className = "update-check-status";
-  statusBox.textContent = "正在连接 GitHub 检查最新正式版...";
-  try {
-    const response = await fetchWithTimeout("./api/check_update", { cache: "no-store" }, 25000);
-    const result = await readJsonResponse(response, "更新检查失败");
-    if (!response.ok || !result.ok) {
-      throw new Error(result.error || "更新检查失败");
-    }
-    if (releaseLink && result.release_url) releaseLink.href = result.release_url;
-    if (result.update_available) {
-      statusBox.className = "update-check-status available";
-      if (result.deployment_mode === "docker") {
-        statusBox.textContent = `发现正式版 ${result.latest_tag}。请在 VPS 执行：${result.update_command}`;
-      } else {
-        statusBox.textContent = `发现正式版 ${result.latest_tag}。请执行：${result.update_command}`;
-      }
-    } else {
-      statusBox.className = "update-check-status current";
-      statusBox.textContent = `当前 ${result.current_version_label} 已是最新正式版。`;
-    }
-  } catch (error) {
-    statusBox.className = "update-check-status error";
-    statusBox.textContent = error.message || "无法连接 GitHub，请稍后重试。";
-  } finally {
-    button.disabled = false;
-  }
-}
 
 if (adminBtn && adminDropdown) {
   adminBtn.onclick = (e) => {
@@ -5617,44 +5877,20 @@ if (adminBtn && adminDropdown) {
     const isShow = adminDropdown.style.display === "block";
     adminDropdown.style.display = isShow ? "none" : "block";
     adminBtn.setAttribute("aria-expanded", isShow ? "false" : "true");
-    if (githubDropdown) {
-      githubDropdown.style.display = "none";
-      if (githubBtn) githubBtn.setAttribute("aria-expanded", "false");
-    }
   };
-}
-
-if (githubBtn && githubDropdown) {
-  githubBtn.onclick = (e) => {
-    e.stopPropagation();
-    const isShow = githubDropdown.style.display === "block";
-    githubDropdown.style.display = isShow ? "none" : "block";
-    githubBtn.setAttribute("aria-expanded", isShow ? "false" : "true");
-    if (adminDropdown) {
-      adminDropdown.style.display = "none";
-      if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
-    }
-  };
-  githubDropdown.onclick = event => event.stopPropagation();
 }
 
 document.addEventListener("click", () => {
   if (adminDropdown) adminDropdown.style.display = "none";
-  if (githubDropdown) githubDropdown.style.display = "none";
   if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
-  if (githubBtn) githubBtn.setAttribute("aria-expanded", "false");
 });
 
 document.addEventListener("keydown", event => {
   if (event.key !== "Escape") return;
-  const githubWasOpen = githubBtn && githubBtn.getAttribute("aria-expanded") === "true";
   const adminWasOpen = adminBtn && adminBtn.getAttribute("aria-expanded") === "true";
   if (adminDropdown) adminDropdown.style.display = "none";
-  if (githubDropdown) githubDropdown.style.display = "none";
   if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
-  if (githubBtn) githubBtn.setAttribute("aria-expanded", "false");
-  if (githubWasOpen && githubBtn) githubBtn.focus();
-  else if (adminWasOpen && adminBtn) adminBtn.focus();
+  if (adminWasOpen && adminBtn) adminBtn.focus();
 });
 
 let showFavoritesOnly = false;
@@ -6054,14 +6290,6 @@ async function saveNetwork(e) {
 
 
 
-function openVpsModal() {
-  showModal("vps_recommend_modal");
-}
-
-function closeVpsModal() {
-  hideModal("vps_recommend_modal");
-}
-
 async function logoutAdmin() {
   try {
     const res = await fetchWithTimeout("./api/logout", { method: "POST" }, 20000);
@@ -6319,12 +6547,13 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
+    # 2. 检测当前活跃 VPN 虚拟网卡是否存在 (Linux 下)
+    tun_dev = vpn_utils.get_active_tun_dev()
+    tun_path = Path(f"/sys/class/net/{tun_dev}")
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
             "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 ({tun_dev}) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -6479,6 +6708,11 @@ def background_proxy_checker() -> None:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
+                        # Hot path first: swap in the pre-connected standby
+                        # tunnel (no handshake delay). Cold switch only when
+                        # no healthy standby exists.
+                        if try_hot_failover(f"代理连通性检测失败: {error_msg}"):
+                            continue
                         with lock:
                             nodes = read_nodes()
                             active_node = next((n for n in nodes if n.get("id") == checked_node_id), None)
@@ -6527,6 +6761,33 @@ def active_node_pinger() -> None:
         except Exception as e:
             print(f"[ERROR] active_node_pinger error: {e}", flush=True)
         time.sleep(10)
+
+
+def standby_monitor_loop() -> None:
+    """Keep the hot-standby tunnel alive: rebuild it when missing or dead.
+
+    Runs every 20s. ensure_standby_connection() is idempotent and guards
+    against concurrent builds / manual connections, so this loop stays dumb.
+    """
+    global last_standby_monitor_heartbeat
+    while True:
+        last_standby_monitor_heartbeat = time.time()
+        try:
+            if (
+                HOT_STANDBY_ENABLED
+                and active_openvpn_running()
+                and not standby_healthy()
+            ):
+                ui_cfg = load_ui_config()
+                if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode", "auto") != "fixed_ip":
+                    threading.Thread(
+                        target=ensure_standby_connection,
+                        name="vpngate-standby-monitor",
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            print(f"[ERROR] standby_monitor_loop error: {e}", flush=True)
+        time.sleep(20)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -6659,14 +6920,6 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
-        elif effective_path == "/api/check_update":
-            try:
-                self.send_json(check_latest_release())
-            except Exception as exc:
-                self.send_json(
-                    {"ok": False, "error": f"无法检查 GitHub 正式版更新: {exc}"},
-                    HTTPStatus.BAD_GATEWAY,
-                )
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
@@ -7337,6 +7590,11 @@ def main() -> None:
     threading.Thread(target=ip_enrichment_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    if HOT_STANDBY_ENABLED:
+        threading.Thread(target=standby_monitor_loop, daemon=True).start()
+    # Write-behind persistence for the in-memory UI state (see set_state).
+    threading.Thread(target=state_flusher_loop, daemon=True).start()
+    atexit.register(flush_state)
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
