@@ -3524,6 +3524,8 @@ INDEX_HTML = r"""<!doctype html>
       --warning-gradient: linear-gradient(135deg, #fbbf24 0%, #d97706 100%);
       --active-row-bg: rgba(16, 185, 129, 0.06);
       --active-row-border: rgba(16, 185, 129, 0.25);
+      --standby-row-bg: rgba(99, 102, 241, 0.06);
+      --standby-row-border: rgba(99, 102, 241, 0.25);
     }
 
     body {
@@ -4214,6 +4216,19 @@ INDEX_HTML = r"""<!doctype html>
       border-top: 1px solid var(--active-row-border);
     }
 
+    .standby-row {
+      background: var(--standby-row-bg) !important;
+      outline: 2px solid var(--primary) !important;
+      outline-offset: -2px;
+      position: relative;
+      z-index: 4;
+    }
+
+    .standby-row td {
+      border-bottom: 1px solid var(--standby-row-border);
+      border-top: 1px solid var(--standby-row-border);
+    }
+
     .badge {
       padding: 4px 10px;
       border-radius: 6px;
@@ -4267,6 +4282,12 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(59, 130, 246, 0.12);
       color: #93c5fd;
       border-color: rgba(59, 130, 246, 0.24);
+    }
+
+    .standby {
+      background: rgba(99, 102, 241, 0.15);
+      color: #a5b4fc;
+      border-color: rgba(99, 102, 241, 0.35);
     }
 
     .current-badge {
@@ -4442,6 +4463,10 @@ INDEX_HTML = r"""<!doctype html>
       .table-container tbody tr.active-row {
         border-color: var(--active-row-border);
         background: var(--active-row-bg);
+      }
+      .table-container tbody tr.standby-row {
+        border-color: var(--standby-row-border);
+        background: var(--standby-row-bg);
       }
       .table-container tbody td {
         display: flex;
@@ -5641,10 +5666,11 @@ function render(){
       if (!n) return '';
       const isCurrentlyActive = activeNode && n.id === activeNode.id;
       const isPending = Boolean(state.is_connecting && state.pending_node_id === n.id);
-      const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
+      const isStandby = !isCurrentlyActive && !isPending && Boolean(n.standby);
+      const rowClass = isCurrentlyActive ? 'class="active-row"' : (isStandby ? 'class="standby-row"' : '');
       
-      const badgeClass = isCurrentlyActive ? 'available' : (isPending ? 'testing' : (n.probe_status || 'not_checked'));
-      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : (isPending ? '<span class="badge-pulse"></span>切换中' : translateStatus(n.probe_status));
+      const badgeClass = isCurrentlyActive ? 'available' : (isPending ? 'testing' : (isStandby ? 'standby' : (n.probe_status || 'not_checked')));
+      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : (isPending ? '<span class="badge-pulse"></span>切换中' : (isStandby ? '热备' : translateStatus(n.probe_status)));
       const latencyText = nodeLatencyHtml(n);
       const displayLocation = n.location || translateCountry(n.country) || "-";
       const flag = countryFlag(n.geo_country_short || n.country_short);
