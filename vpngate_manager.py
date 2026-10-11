@@ -198,6 +198,16 @@ PRIMARY_TUN_DEV = "tun0"
 STANDBY_TUN_DEV = "tun1"
 HOT_STANDBY_ENABLED = env_int("AIMILIVPN_HOT_STANDBY", 1, 0, 1) == 1
 
+
+def hot_standby_allowed() -> bool:
+    """Effective hot-standby switch: env hard-gate AND the UI toggle."""
+    if not HOT_STANDBY_ENABLED:
+        return False
+    try:
+        return bool(load_ui_config().get("hot_standby_enabled", True))
+    except Exception:
+        return True
+
 standby_openvpn_process: subprocess.Popen[str] | None = None
 standby_openvpn_node_id = ""
 active_tun_dev = PRIMARY_TUN_DEV
@@ -409,6 +419,7 @@ def load_ui_config() -> dict[str, Any]:
             "force_country": "",
             "routing_ip_type": "all",
             "connection_enabled": True,
+            "hot_standby_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
             "fav_fail_fallback": False,
@@ -424,7 +435,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "hot_standby_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -652,7 +663,7 @@ def get_state() -> dict[str, Any]:
     state["maintenance_running"] = maintenance_lock.locked()
     # Hot-standby dual tunnel status, derived from live globals so the UI
     # never shows a stale standby state.
-    state["hot_standby_enabled"] = HOT_STANDBY_ENABLED
+    state["hot_standby_enabled"] = hot_standby_allowed()
     state["active_tun_dev"] = active_tun_dev
     state["standby_tun_dev"] = standby_tun_dev
     state["standby_node_id"] = standby_openvpn_node_id
@@ -1715,17 +1726,25 @@ def setup_policy_routing(interface: str = "tun0") -> bool:
         log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {table} 添加默认路由")
     return success
 
-def cleanup_policy_routing() -> None:
-    for table in sorted(set(TUN_TABLES.values())):
+def cleanup_policy_routing(tables=None) -> None:
+    targets = sorted(set(TUN_TABLES.values())) if tables is None else sorted(set(tables))
+    for table in targets:
         table = str(table)
         try:
             subprocess.run(["ip", "rule", "del", "table", table], capture_output=True, timeout=2)
             subprocess.run(["ip", "route", "flush", "table", table], capture_output=True, timeout=2)
         except Exception:
             pass
-    print("[policy_routing] Cleared policy routing tables 100/101", flush=True)
+    print(f"[policy_routing] Cleared policy routing tables {targets}", flush=True)
 
-def stop_active_openvpn() -> None:
+def stop_active_openvpn(keep_standby: bool = False) -> None:
+    """Stop the active (serving) tunnel.
+
+    With ``keep_standby=True`` (used by manual node switches) a healthy
+    standby tunnel is left untouched -- its process, tun device and policy
+    routing table all survive -- so it does not flap along with the active
+    switch. The default ``False`` keeps the previous full-teardown behavior.
+    """
     global active_openvpn_process, active_openvpn_node_id
     global active_tun_dev, standby_tun_dev, standby_cancel_event
     # Cancel any in-flight standby build first so it cannot resurrect afterwards.
@@ -1734,9 +1753,15 @@ def stop_active_openvpn() -> None:
         standby_cancel_event = None
     if cancel_event is not None:
         cancel_event.set()
-    stop_standby_openvpn()
+    if not keep_standby:
+        stop_standby_openvpn()
     with lock:
-        cleanup_policy_routing()
+        if keep_standby:
+            # Only flush the active tunnel's table; the standby keeps serving
+            # on its own device/table.
+            cleanup_policy_routing(tables={tun_table(active_tun_dev)})
+        else:
+            cleanup_policy_routing()
         config_to_delete = None
         if active_openvpn_node_id:
             nodes = read_nodes()
@@ -1747,10 +1772,11 @@ def stop_active_openvpn() -> None:
         stop_process(active_openvpn_process)
         active_openvpn_process = None
         active_openvpn_node_id = ""
-        # Reset tunnel roles to their defaults.
-        active_tun_dev = PRIMARY_TUN_DEV
-        standby_tun_dev = STANDBY_TUN_DEV
-        vpn_utils.set_active_tun_dev(active_tun_dev)
+        if not keep_standby:
+            # Reset tunnel roles to their defaults.
+            active_tun_dev = PRIMARY_TUN_DEV
+            standby_tun_dev = STANDBY_TUN_DEV
+            vpn_utils.set_active_tun_dev(active_tun_dev)
 
         if config_to_delete:
             try:
@@ -1763,14 +1789,25 @@ def stop_active_openvpn() -> None:
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
-def standby_healthy() -> bool:
-    """True when the hot-standby tunnel process is alive and bound to a node."""
+def _standby_tun_device_present() -> bool:
+    """Cheap kernel-device check for the standby tunnel (no network I/O)."""
     with lock:
-        return (
-            standby_openvpn_process is not None
-            and standby_openvpn_process.poll() is None
-            and bool(standby_openvpn_node_id)
-        )
+        dev = standby_tun_dev
+    return not sys.platform.startswith("linux") or Path(f"/sys/class/net/{dev}").exists()
+
+
+def standby_healthy() -> bool:
+    """True when the hot-standby tunnel process is alive and bound to a node.
+
+    A process can outlive its tunnel (stuck TLS, dead session), so also
+    require the kernel device to exist. This stays cheap: no network I/O.
+    """
+    with lock:
+        proc = standby_openvpn_process
+        node_id = standby_openvpn_node_id
+    if proc is None or proc.poll() is not None or not node_id:
+        return False
+    return _standby_tun_device_present()
 
 def check_tunnel_health(dev: str, timeout: int = 8) -> bool:
     """Egress check for one specific tunnel device (used for the standby).
@@ -1833,7 +1870,7 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
     """
     global standby_openvpn_process, standby_openvpn_node_id
     node_id = str(node_id or "").strip()
-    if not node_id or not HOT_STANDBY_ENABLED:
+    if not node_id or not hot_standby_allowed():
         return False
     try:
         nodes = read_nodes()
@@ -1926,7 +1963,7 @@ def ensure_standby_connection() -> None:
     """
     global standby_building, standby_cancel_event
     global standby_openvpn_process, standby_openvpn_node_id
-    if not HOT_STANDBY_ENABLED:
+    if not hot_standby_allowed():
         return
     with lock:
         if standby_building or is_connecting or not active_openvpn_running():
@@ -1982,7 +2019,7 @@ def try_hot_failover(reason: str) -> bool:
     global active_openvpn_process, active_openvpn_node_id
     global standby_openvpn_process, standby_openvpn_node_id
     global active_tun_dev, standby_tun_dev
-    if not HOT_STANDBY_ENABLED:
+    if not hot_standby_allowed():
         return False
     with lock:
         if not standby_healthy():
@@ -2649,6 +2686,7 @@ def connect_node(node_id: str) -> str:
 
     token, cancel_event = begin_connection_attempt()
     stopped_existing = False
+    keep_standby = False
     previous_node_id = ""
     try:
         set_state(
@@ -2727,7 +2765,16 @@ def connect_node(node_id: str) -> str:
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
         set_state(active_node_latency="清理连接", last_check_message="目标节点可用，正在关闭旧的 VPN 连接及网卡...")
-        stop_active_openvpn()
+        # Manual switch: keep a healthy standby tunnel alive so it does not
+        # flap along with the active switch. Only rebuild it when it shadows
+        # the new active node or is unhealthy.
+        with lock:
+            keep_standby = bool(
+                standby_openvpn_node_id
+                and standby_openvpn_node_id != node_id
+                and standby_healthy()
+            )
+        stop_active_openvpn(keep_standby=keep_standby)
         stopped_existing = True
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
@@ -2829,13 +2876,13 @@ def connect_node(node_id: str) -> str:
             )
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 {active_tun_dev} 已启用")
         cancel_background_refill()
-        if HOT_STANDBY_ENABLED:
+        if hot_standby_allowed():
             # The primary tunnel is up: build the hot backup in the background.
             threading.Thread(target=ensure_standby_connection, name="vpngate-standby-build", daemon=True).start()
         return f"Connected {node_id}"
     except ConnectionCancelled:
         if stopped_existing:
-            stop_active_openvpn()
+            stop_active_openvpn(keep_standby=keep_standby)
         raise
     except Exception as exc:
         if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):
@@ -2854,6 +2901,90 @@ def connect_node(node_id: str) -> str:
     finally:
         finish_connection_attempt(token, cancel_event)
         set_state(pending_node_id="")
+
+def merge_fresh_candidates(
+    current_nodes: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge a fresh node snapshot into the stored node list.
+
+    Rules:
+    - the currently active node is always kept (never dropped);
+    - a live hot-standby node is kept even when absent from the snapshot;
+    - previously measured data (probe results, IP enrichment) carries over;
+    - the "standby" marker is reconciled from the live standby tunnel state,
+      because fresh snapshots never carry it;
+    - the result is capped at 1000 nodes.
+
+    Caller must hold ``lock``: the standby/active globals are read directly.
+    """
+    current_by_id = {
+        str(n.get("id")): n for n in current_nodes if n.get("id")
+    }
+    active_node = None
+    if active_openvpn_node_id:
+        active_node = next(
+            (n for n in current_nodes if n.get("id") == active_openvpn_node_id),
+            None,
+        )
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    # Keep the live hot-standby node as well: the merge below rebuilds the
+    # list from the fresh snapshot, which would otherwise drop it (and its
+    # "standby" marker) when it is absent from the new snapshot.
+    standby_id = str(standby_openvpn_node_id or "")
+    if (
+        standby_id
+        and standby_openvpn_process is not None
+        and standby_openvpn_process.poll() is None
+    ):
+        prev_standby = current_by_id.get(standby_id)
+        if prev_standby is not None and standby_id not in seen_ids:
+            merged.append(prev_standby)
+            seen_ids.add(standby_id)
+
+    if active_node:
+        merged.append(active_node)
+        seen_ids.add(active_node["id"])
+
+    for cand in candidates:
+        if cand["id"] not in seen_ids:
+            previous = current_by_id.get(str(cand["id"]))
+            if previous:
+                for key in [
+                    "probe_status",
+                    "probe_message",
+                    "latency_ms",
+                    "probed_at",
+                    "owner",
+                    "asn",
+                    "as_name",
+                    "location",
+                    "ip_type",
+                    "quality",
+                    "is_proxy",
+                    "is_hosting",
+                    "is_mobile",
+                    "ip_type_reason",
+                ]:
+                    if previous.get(key) not in (None, ""):
+                        cand[key] = previous.get(key)
+            merged.append(cand)
+            seen_ids.add(cand["id"])
+
+    if len(merged) > 1000:
+        merged = merged[:1000]
+    # Reconcile the standby marker: fresh snapshots never carry it.
+    live_standby_id = (
+        str(standby_openvpn_node_id or "")
+        if standby_openvpn_process is not None
+        and standby_openvpn_process.poll() is None
+        else ""
+    )
+    for node in merged:
+        node["standby"] = bool(live_standby_id) and str(node.get("id") or "") == live_standby_id
+    return merged
+
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -2909,50 +3040,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         with lock:
             current_nodes = read_nodes()
-            current_by_id = {
-                str(n.get("id")): n
-                for n in current_nodes
-                if n.get("id")
-            }
-            active_node = None
-            if active_openvpn_node_id:
-                active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
-                
-            merged: list[dict[str, Any]] = []
-            seen_ids: set[str] = set()
-            
-            if active_node:
-                merged.append(active_node)
-                seen_ids.add(active_node["id"])
-                
-            for cand in candidates:
-                if cand["id"] not in seen_ids:
-                    previous = current_by_id.get(str(cand["id"]))
-                    if previous:
-                        for key in [
-                            "probe_status",
-                            "probe_message",
-                            "latency_ms",
-                            "probed_at",
-                            "owner",
-                            "asn",
-                            "as_name",
-                            "location",
-                            "ip_type",
-                            "quality",
-                            "is_proxy",
-                            "is_hosting",
-                            "is_mobile",
-                            "ip_type_reason",
-                        ]:
-                            if previous.get(key) not in (None, ""):
-                                cand[key] = previous.get(key)
-                    merged.append(cand)
-                    seen_ids.add(cand["id"])
-                    
-            if len(merged) > 1000:
-                merged = merged[:1000]
-                
+            merged = merge_fresh_candidates(current_nodes, candidates)
+
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -4312,6 +4401,66 @@ INDEX_HTML = r"""<!doctype html>
       .toolbar > input {
         font-size: 16px;
       }
+      /* Node table becomes stacked cards on phones: no more sideways scroll */
+      .table-container table {
+        min-width: 0;
+      }
+      .table-container thead {
+        display: none;
+      }
+      .table-container tbody,
+      .table-container tr,
+      .table-container td {
+        display: block;
+        width: 100%;
+      }
+      .table-container tbody tr {
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        margin: 0 12px 12px 12px;
+        width: calc(100% - 24px);
+        padding: 10px 14px;
+        box-sizing: border-box;
+      }
+      .table-container tbody tr.active-row {
+        border-color: var(--active-row-border);
+        background: var(--active-row-bg);
+      }
+      .table-container tbody td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 7px 0;
+        border: none;
+        white-space: normal !important;
+        max-width: none !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        font-size: 13px;
+      }
+      .table-container tbody td::before {
+        content: attr(data-label);
+        flex-shrink: 0;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+      .table-container tbody td[data-label="操作"]::before {
+        content: none;
+      }
+      .table-container tbody td[data-label="操作"] {
+        padding-top: 10px;
+      }
+      .table-container .table-actions {
+        width: 100%;
+        white-space: normal;
+      }
+      .table-container .table-actions button {
+        flex: 1;
+        min-height: 40px;
+      }
     }
     
     /* Admin dropdown styles */
@@ -4778,6 +4927,13 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
           
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label" style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin-bottom: 0;">
+              <input type="checkbox" id="net_hot_standby" checked style="width: 18px; height: 18px; accent-color: #4da3ff; cursor: pointer; flex-shrink: 0;">
+              <span>双隧道热备<span style="color: var(--text-secondary); font-weight: 400;">（主隧道故障时无感切换到备用隧道）</span></span>
+            </label>
+          </div>
+
           <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
             ℹ️ <strong>自动配置</strong>：全自动测试并选择最佳IP。在使用过程中，如果当前连接节点没有失效，将不再更换IP；如果当前节点失效，系统将立刻秒级自动漂移到其他最快的可用节点。
           </div>
@@ -5501,13 +5657,13 @@ function render(){
         : `<button class="test-btn" ${favoriteBusy ? "disabled" : ""} style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">${favoriteBusy ? "处理中" : "☆ 收藏"}</button>`;
 
       return `<tr ${rowClass}>
-        <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
-        <td style="white-space: nowrap;">${latencyText}</td>
-        <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
-        <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
-        <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
-        <td>
+        <td data-label="状态"><span class="badge ${badgeClass}">${badgeText}</span></td>
+        <td data-label="IP 地址:端口" class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td data-label="延迟" style="white-space: nowrap;">${latencyText}</td>
+        <td data-label="物理位置" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
+        <td data-label="运营主体/ISP" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
+        <td data-label="IP 类型" style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
+        <td data-label="操作">
           <div class="table-actions">
             ${testBtn}
             ${favBtn}
@@ -6192,6 +6348,7 @@ function openNetworkModal() {
     
     selectOptionCard('routing_mode', mode);
     selectOptionCard('routing_ip_type', ipType);
+    $("net_hot_standby").checked = state.hot_standby_enabled !== false;
   }
   
   populateRoutingCountries();
@@ -6251,7 +6408,8 @@ async function saveNetwork(e) {
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+        routing_ip_type: routingIpType,
+        hot_standby_enabled: $("net_hot_standby").checked
       })
     }, 25000);
     const data = await readJsonResponse(res, "保存代理设置失败");
@@ -6774,7 +6932,7 @@ def standby_monitor_loop() -> None:
         last_standby_monitor_heartbeat = time.time()
         try:
             if (
-                HOT_STANDBY_ENABLED
+                hot_standby_allowed()
                 and active_openvpn_running()
                 and not standby_healthy()
             ):
@@ -7180,6 +7338,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body()
                 
                 new_proxy_port = payload.get("proxy_port")
+                hot_standby_enabled = payload.get("hot_standby_enabled", None)
+                if hot_standby_enabled is not None:
+                    hot_standby_enabled = bool(hot_standby_enabled)
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
@@ -7215,6 +7376,9 @@ class Handler(BaseHTTPRequestHandler):
                 
                 ui_cfg["proxy_port"] = new_proxy_port_int
                 ui_cfg["routing_mode"] = routing_mode
+                old_hot_standby = bool(ui_cfg.get("hot_standby_enabled", True))
+                if hot_standby_enabled is not None:
+                    ui_cfg["hot_standby_enabled"] = hot_standby_enabled
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 if routing_mode == "favorites":
@@ -7228,6 +7392,19 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(auth_file, ui_cfg)
 
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
+                if hot_standby_enabled is not None and hot_standby_enabled != old_hot_standby:
+                    if hot_standby_enabled:
+                        threading.Thread(
+                            target=ensure_standby_connection,
+                            name="vpngate-standby-ui-enable",
+                            daemon=True,
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=stop_standby_openvpn,
+                            name="vpngate-standby-ui-disable",
+                            daemon=True,
+                        ).start()
                 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
                 if restart_needed:
@@ -7591,6 +7768,7 @@ def main() -> None:
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     if HOT_STANDBY_ENABLED:
+        # NOTE: env hard-gate only; the UI toggle is honored inside the loop.
         threading.Thread(target=standby_monitor_loop, daemon=True).start()
     # Write-behind persistence for the in-memory UI state (see set_state).
     threading.Thread(target=state_flusher_loop, daemon=True).start()

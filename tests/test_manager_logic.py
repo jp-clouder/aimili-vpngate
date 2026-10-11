@@ -544,7 +544,12 @@ class ManagerLogicTests(unittest.TestCase):
         manager.standby_openvpn_node_id = "node-1"
         manager.vpn_utils.set_active_tun_dev("tun0")
 
-        with mock.patch.object(manager, "ensure_standby_connection"):
+        with (
+            mock.patch.object(manager, "ensure_standby_connection"),
+            mock.patch.object(
+                manager, "_standby_tun_device_present", return_value=True
+            ),
+        ):
             self.assertTrue(manager.try_hot_failover("test"))
 
         # Roles swapped: the standby now serves traffic on its own device.
@@ -1132,6 +1137,175 @@ class ManagerLogicTests(unittest.TestCase):
             snapshot_utils.parse_and_validate_snapshot(csv_text)
 
 
+    def test_stop_active_openvpn_keep_standby_preserves_standby(self) -> None:
+        """Manual switch must not flap a healthy standby tunnel."""
+        active_proc = FakeProcess()
+        standby_proc = FakeProcess()
+        old = (
+            manager.active_openvpn_process,
+            manager.active_openvpn_node_id,
+            manager.standby_openvpn_process,
+            manager.standby_openvpn_node_id,
+            manager.active_tun_dev,
+            manager.standby_tun_dev,
+        )
+        manager.active_openvpn_process = active_proc
+        manager.active_openvpn_node_id = "node-active"
+        manager.standby_openvpn_process = standby_proc
+        manager.standby_openvpn_node_id = "node-standby"
+        manager.active_tun_dev = "tun0"
+        manager.standby_tun_dev = "tun1"
+        try:
+            with (
+                mock.patch.object(manager, "stop_standby_openvpn") as stop_sb_mock,
+                mock.patch.object(manager, "cleanup_policy_routing") as cleanup_mock,
+            ):
+                manager.stop_active_openvpn(keep_standby=True)
+            stop_sb_mock.assert_not_called()
+            # only the active tunnel's table is flushed; standby keeps its own
+            cleanup_mock.assert_called_once_with(tables={100})
+            self.assertTrue(standby_proc.running)
+            self.assertFalse(active_proc.running)
+            self.assertEqual("node-standby", manager.standby_openvpn_node_id)
+            self.assertIs(standby_proc, manager.standby_openvpn_process)
+            # tunnel roles are left alone while the standby survives
+            self.assertEqual("tun0", manager.active_tun_dev)
+            self.assertEqual("tun1", manager.standby_tun_dev)
+        finally:
+            (
+                manager.active_openvpn_process,
+                manager.active_openvpn_node_id,
+                manager.standby_openvpn_process,
+                manager.standby_openvpn_node_id,
+                manager.active_tun_dev,
+                manager.standby_tun_dev,
+            ) = old
+
+    def test_stop_active_openvpn_default_still_kills_standby(self) -> None:
+        """Default teardown keeps the old full-disconnect behavior."""
+        active_proc = FakeProcess()
+        standby_proc = FakeProcess()
+        old = (
+            manager.active_openvpn_process,
+            manager.active_openvpn_node_id,
+            manager.standby_openvpn_process,
+            manager.standby_openvpn_node_id,
+            manager.active_tun_dev,
+            manager.standby_tun_dev,
+        )
+        manager.active_openvpn_process = active_proc
+        manager.active_openvpn_node_id = "node-active"
+        manager.standby_openvpn_process = standby_proc
+        manager.standby_openvpn_node_id = "node-standby"
+        manager.active_tun_dev = "tun1"
+        manager.standby_tun_dev = "tun0"
+        try:
+            with mock.patch.object(manager, "cleanup_policy_routing") as cleanup_mock:
+                manager.stop_active_openvpn()
+            cleanup_mock.assert_called_once_with()
+            self.assertFalse(standby_proc.running)
+            self.assertEqual("", manager.standby_openvpn_node_id)
+            self.assertEqual("tun0", manager.active_tun_dev)
+            self.assertEqual("tun1", manager.standby_tun_dev)
+        finally:
+            (
+                manager.active_openvpn_process,
+                manager.active_openvpn_node_id,
+                manager.standby_openvpn_process,
+                manager.standby_openvpn_node_id,
+                manager.active_tun_dev,
+                manager.standby_tun_dev,
+            ) = old
+
+    def test_manual_switch_preserves_healthy_standby(self) -> None:
+        """connect_node() to another node must leave a healthy standby alone."""
+        nodes = self.write_nodes(3)
+        active_proc = FakeProcess()
+        standby_proc = FakeProcess()
+        new_proc = FakeProcess()
+        manager.active_openvpn_process = active_proc
+        manager.active_openvpn_node_id = nodes[0]["id"]
+        manager.standby_openvpn_process = standby_proc
+        manager.standby_openvpn_node_id = nodes[2]["id"]
+        try:
+            with (
+                mock.patch.object(
+                    manager,
+                    "run_openvpn_until_ready",
+                    return_value=(True, "ready", new_proc),
+                ),
+                mock.patch.object(manager, "setup_policy_routing", return_value=True),
+                mock.patch.object(manager, "cleanup_policy_routing"),
+                mock.patch.object(manager, "stop_standby_openvpn") as stop_sb_mock,
+                mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+                mock.patch.object(
+                    manager,
+                    "check_proxy_health",
+                    return_value={"ok": True, "ip": "198.51.100.9", "latency_ms": 10},
+                ),
+                mock.patch.object(manager, "standby_healthy", return_value=True),
+                mock.patch.object(manager, "ensure_standby_connection"),
+                mock.patch.object(manager, "log_to_json"),
+                mock.patch.object(manager, "validate_node_allowed_by_routing"),
+            ):
+                result = manager.connect_node(nodes[1]["id"])
+            self.assertIn("Connected", result)
+            self.assertEqual(nodes[1]["id"], manager.active_openvpn_node_id)
+            stop_sb_mock.assert_not_called()
+            self.assertTrue(standby_proc.running)
+            self.assertIs(standby_proc, manager.standby_openvpn_process)
+            self.assertEqual(nodes[2]["id"], manager.standby_openvpn_node_id)
+        finally:
+            manager.active_openvpn_process = None
+            manager.active_openvpn_node_id = ""
+            manager.standby_openvpn_process = None
+            manager.standby_openvpn_node_id = ""
+
+    def test_manual_switch_to_standby_node_rebuilds_standby(self) -> None:
+        """Switching onto the standby node must drop it (no shadowing)."""
+        nodes = self.write_nodes(2)
+        active_proc = FakeProcess()
+        standby_proc = FakeProcess()
+        new_proc = FakeProcess()
+        manager.active_openvpn_process = active_proc
+        manager.active_openvpn_node_id = nodes[0]["id"]
+        manager.standby_openvpn_process = standby_proc
+        manager.standby_openvpn_node_id = nodes[1]["id"]
+        try:
+            with (
+                mock.patch.object(
+                    manager,
+                    "run_openvpn_until_ready",
+                    return_value=(True, "ready", new_proc),
+                ),
+                mock.patch.object(manager, "setup_policy_routing", return_value=True),
+                mock.patch.object(manager, "cleanup_policy_routing"),
+                mock.patch.object(manager, "stop_standby_openvpn") as stop_sb_mock,
+                mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+                mock.patch.object(
+                    manager,
+                    "check_proxy_health",
+                    return_value={"ok": True, "ip": "198.51.100.9", "latency_ms": 10},
+                ),
+                mock.patch.object(manager, "standby_healthy", return_value=True),
+                mock.patch.object(manager, "ensure_standby_connection") as ensure_mock,
+                mock.patch.object(manager, "log_to_json"),
+                mock.patch.object(manager, "validate_node_allowed_by_routing"),
+                mock.patch.object(manager.threading, "Thread") as thread_mock,
+            ):
+                result = manager.connect_node(nodes[1]["id"])
+            self.assertIn("Connected", result)
+            self.assertEqual(nodes[1]["id"], manager.active_openvpn_node_id)
+            # standby shadowed the new active: torn down and scheduled for rebuild
+            stop_sb_mock.assert_called_once_with()
+            thread_mock.assert_called_once()
+            ensure_mock.assert_not_called()  # runs in the background thread
+        finally:
+            manager.active_openvpn_process = None
+            manager.active_openvpn_node_id = ""
+            manager.standby_openvpn_process = None
+            manager.standby_openvpn_node_id = ""
+
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
         class Client:
@@ -1215,5 +1389,108 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
         self.assertEqual([("first", "first"), ("second", "second")], seen)
 
 
+    def test_merge_keeps_live_standby_node_absent_from_snapshot(self) -> None:
+        """A live standby node must survive the periodic refresh merge even
+        when the fresh snapshot no longer contains it (regression: the UI
+        standby badge used to vanish every refresh cycle)."""
+        old_proc, old_id, old_active = (
+            manager.standby_openvpn_process,
+            manager.standby_openvpn_node_id,
+            manager.active_openvpn_node_id,
+        )
+        proc = FakeProcess()
+        manager.standby_openvpn_process = proc
+        manager.standby_openvpn_node_id = "node-standby"
+        manager.active_openvpn_node_id = "node-active"
+        try:
+            current = [
+                {"id": "node-active", "active": True},
+                {"id": "node-standby", "standby": True, "probe_status": "available"},
+                {"id": "node-gone", "probe_status": "available"},
+            ]
+            # fresh snapshot: active node present, standby node missing
+            candidates = [
+                {"id": "node-active", "config_file": "/tmp/x", "ping": 10},
+                {"id": "node-new", "config_file": "/tmp/y", "ping": 20},
+            ]
+            with manager.lock:
+                merged = manager.merge_fresh_candidates(current, candidates)
+            by_id = {n["id"]: n for n in merged}
+            self.assertIn("node-standby", by_id)
+            self.assertTrue(by_id["node-standby"]["standby"])
+            self.assertTrue(by_id["node-active"].get("active"))
+            self.assertNotIn("node-gone", by_id)
+            self.assertIn("node-new", by_id)
+            # exactly one standby marker in the whole list
+            self.assertEqual(
+                1, sum(1 for n in merged if n.get("standby"))
+            )
+        finally:
+            manager.standby_openvpn_process = old_proc
+            manager.standby_openvpn_node_id = old_id
+            manager.active_openvpn_node_id = old_active
+
+    def test_merge_clears_standby_marker_when_no_live_standby(self) -> None:
+        old_proc, old_id = (
+            manager.standby_openvpn_process,
+            manager.standby_openvpn_node_id,
+        )
+        manager.standby_openvpn_process = None
+        manager.standby_openvpn_node_id = ""
+        try:
+            current = [{"id": "node-a", "standby": True}]
+            candidates = [{"id": "node-a", "config_file": "/tmp/x"}]
+            with manager.lock:
+                merged = manager.merge_fresh_candidates(current, candidates)
+            self.assertFalse(any(n.get("standby") for n in merged))
+        finally:
+            manager.standby_openvpn_process = old_proc
+            manager.standby_openvpn_node_id = old_id
+
+    def test_standby_healthy_requires_kernel_device(self) -> None:
+        """A live process without its tun device must not count as healthy,
+        otherwise the monitor never rebuilds a broken standby tunnel."""
+        old_proc, old_id, old_dev = (
+            manager.standby_openvpn_process,
+            manager.standby_openvpn_node_id,
+            manager.standby_tun_dev,
+        )
+        manager.standby_openvpn_process = FakeProcess()
+        manager.standby_openvpn_node_id = "node-standby"
+        # point at a device that cannot exist on the test machine
+        manager.standby_tun_dev = "tun9"
+        try:
+            import sys as _sys
+
+            if _sys.platform.startswith("linux"):
+                self.assertFalse(manager.standby_healthy())
+            else:
+                self.assertTrue(manager.standby_healthy())
+        finally:
+            manager.standby_openvpn_process = old_proc
+            manager.standby_openvpn_node_id = old_id
+            manager.standby_tun_dev = old_dev
+
+
+    def test_hot_standby_allowed_respects_ui_toggle(self) -> None:
+        with mock.patch.object(
+            manager, "load_ui_config", return_value={"hot_standby_enabled": False}
+        ):
+            self.assertFalse(manager.hot_standby_allowed())
+        with mock.patch.object(
+            manager, "load_ui_config", return_value={"hot_standby_enabled": True}
+        ):
+            self.assertTrue(manager.hot_standby_allowed())
+        # missing key defaults to enabled
+        with mock.patch.object(manager, "load_ui_config", return_value={}):
+            self.assertTrue(manager.hot_standby_allowed())
+        # env hard-gate wins over the UI toggle
+        with (
+            mock.patch.object(
+                manager, "load_ui_config", return_value={"hot_standby_enabled": True}
+            ),
+            mock.patch.object(manager, "HOT_STANDBY_ENABLED", False),
+        ):
+            self.assertFalse(manager.hot_standby_allowed())
 if __name__ == "__main__":
     unittest.main()
