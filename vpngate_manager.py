@@ -3577,6 +3577,8 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       gap: 8px;
+      flex-wrap: wrap;
+      row-gap: 6px;
     }
 
     .status-dot {
@@ -3586,6 +3588,20 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--success);
       box-shadow: 0 0 10px var(--success);
       display: inline-block;
+      flex-shrink: 0;
+    }
+
+    /* Each status segment stays together when the bar wraps on narrow screens,
+       so e.g. the hot-standby badge never gets stranded far from its label. */
+    .status-seg {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .status-seg.status-msg {
+      white-space: normal;
     }
 
     .btn-group {
@@ -5499,9 +5515,9 @@ function render(){
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
               <span title="IP 情报源推测位置；节点申报国家见标题">物理位置: <strong>${locationFlag ? `${esc(locationFlag)} ` : ""}${esc(displayLocation)}</strong></span>
-              <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
-              <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
-              <span style="margin-left: 12px;" title="${esc(ipTypeTitle)}">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+              <span>延时: <strong>${latencyText}</strong></span>
+              <span>运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
+              <span title="${esc(ipTypeTitle)}">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
             </div>
           </div>
         </div>
@@ -5539,20 +5555,20 @@ function render(){
   if ($("active")) $("active").textContent = activeNode ? 1 : 0; 
   
   const statusMessage = state.last_check_message || "";
-  const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
+  const activeNodeInfo = activeNode ? `<span class="badge available" style="padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="padding:2px 8px;">无</span>`;
   const standbyNode = nodes.find(n => n && n.standby);
   let standbyInfo;
   if (!state.hot_standby_enabled) {
-    standbyInfo = `<span class="badge not_checked" style="margin-left:8px; padding:2px 8px;">未启用</span>`;
+    standbyInfo = `<span class="badge not_checked" style="padding:2px 8px;">未启用</span>`;
   } else if (standbyNode) {
-    standbyInfo = `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(standbyNode.country))} (${esc(standbyNode.id)})</span>`;
+    standbyInfo = `<span class="badge available" style="padding:2px 8px;">${esc(translateCountry(standbyNode.country))} (${esc(standbyNode.id)})</span>`;
   } else if (state.standby_status === "building") {
-    standbyInfo = `<span class="badge" style="margin-left:8px; padding:2px 8px;">建立中…</span>`;
+    standbyInfo = `<span class="badge" style="padding:2px 8px;">建立中…</span>`;
   } else {
-    standbyInfo = `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
+    standbyInfo = `<span class="badge unavailable" style="padding:2px 8px;">无</span>`;
   }
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
-  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 热备：${standbyInfo} | 状态：${esc(statusMessage)}`; }
+  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span><span class="status-seg">HTTP 代理本地接口：${esc(localProxy)}</span><span class="status-seg">活动节点：${activeNodeInfo}</span><span class="status-seg">热备：${standbyInfo}</span><span class="status-seg status-msg">状态：${esc(statusMessage)}</span>`; }
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -5658,7 +5674,7 @@ function render(){
 
       return `<tr ${rowClass}>
         <td data-label="状态"><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td data-label="IP 地址:端口" class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td data-label="IP 地址 : 端口" class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
         <td data-label="延迟" style="white-space: nowrap;">${latencyText}</td>
         <td data-label="物理位置" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
         <td data-label="运营主体/ISP" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
