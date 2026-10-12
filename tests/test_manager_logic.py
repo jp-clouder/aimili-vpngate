@@ -982,6 +982,33 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(1, removed)
         self.assertEqual({"active": 101.0}, manager.active_sessions)
 
+    def test_sessions_persist_and_reload_across_restart(self) -> None:
+        sessions_file = Path(self.temp_dir.name) / "sessions.json"
+        with mock.patch.object(manager, "SESSIONS_FILE", sessions_file):
+            manager.active_sessions["tok-keep"] = time.time() + 3600
+            manager.save_sessions()
+            # 模拟重启：内存清空后从磁盘恢复
+            manager.active_sessions.clear()
+            manager.load_persisted_sessions()
+            self.assertIn("tok-keep", manager.active_sessions)
+
+    def test_load_sessions_skips_expired_tokens(self) -> None:
+        sessions_file = Path(self.temp_dir.name) / "sessions.json"
+        sessions_file.write_text(
+            json.dumps({"tok-old": time.time() - 10, "tok-new": time.time() + 3600}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(manager, "SESSIONS_FILE", sessions_file):
+            manager.load_persisted_sessions()
+            self.assertNotIn("tok-old", manager.active_sessions)
+            self.assertIn("tok-new", manager.active_sessions)
+
+    def test_load_sessions_missing_file_is_noop(self) -> None:
+        sessions_file = Path(self.temp_dir.name) / "sessions.json"
+        with mock.patch.object(manager, "SESSIONS_FILE", sessions_file):
+            manager.load_persisted_sessions()  # 不应抛异常
+            self.assertEqual({}, manager.active_sessions)
+
     def test_web_log_reader_only_returns_recent_valid_entries(self) -> None:
         log_file = manager.DATA_DIR / "logs" / "current.json"
         log_file.parent.mkdir(parents=True)

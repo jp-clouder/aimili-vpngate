@@ -160,6 +160,7 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+SESSIONS_FILE = DATA_DIR / "sessions.json"  # 登录会话持久化：重启后监控无需重新登录
 API_CACHE_FILE = DATA_DIR / "api_snapshot.csv"
 API_CACHE_META_FILE = DATA_DIR / "api_snapshot.meta.json"
 BUNDLED_SNAPSHOT_FILE = ROOT_DIR / "mirror" / "vpngate.csv"
@@ -253,7 +254,44 @@ def purge_expired_sessions(now: float | None = None) -> int:
         ]
         for token in expired_tokens:
             active_sessions.pop(token, None)
+    if expired_tokens:
+        save_sessions()
     return len(expired_tokens)
+
+
+def save_sessions() -> None:
+    """将会话落盘（原子写入），服务重启后仍有效，无需重新登录。"""
+    with lock:
+        snapshot = dict(active_sessions)
+    try:
+        tmp = SESSIONS_FILE.with_name(SESSIONS_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+        os.replace(tmp, SESSIONS_FILE)
+    except Exception as e:
+        print(f"[会话] 持久化会话失败: {e}", flush=True)
+
+
+def load_persisted_sessions() -> None:
+    """启动时从磁盘恢复未过期的会话。"""
+    try:
+        if not SESSIONS_FILE.exists():
+            return
+        data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[会话] 读取持久化会话失败: {e}", flush=True)
+        return
+    if not isinstance(data, dict):
+        return
+    now = time.time()
+    restored = 0
+    with lock:
+        active_sessions.clear()
+        for token, expires_at in data.items():
+            if isinstance(expires_at, (int, float)) and expires_at > now:
+                active_sessions[str(token)] = float(expires_at)
+                restored += 1
+    if restored:
+        print(f"[会话] 已从磁盘恢复 {restored} 个未过期会话", flush=True)
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -7263,6 +7301,7 @@ class Handler(BaseHTTPRequestHandler):
                     purge_expired_sessions()
                     with lock:
                         active_sessions[token] = time.time() + 30 * 24 * 3600
+                    save_sessions()  # 落盘，重启后监控无需重新登录
                     body = json.dumps({"ok": True}).encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -7293,6 +7332,7 @@ class Handler(BaseHTTPRequestHandler):
                 if session_token:
                     with lock:
                         active_sessions.pop(session_token, None)
+                    save_sessions()
                 secret_path = self.get_secret_path()
                 cookie_path = f"/{secret_path}/" if secret_path else "/"
                 body = json.dumps({"ok": True}).encode("utf-8")
@@ -7358,6 +7398,7 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(auth_file, ui_cfg)
                     if reauth_required:
                         active_sessions.clear()
+                        save_sessions()
                 
                 restart_needed = (new_port_int != expected_port or new_suffix != expected_suffix)
                 if restart_needed:
@@ -7731,6 +7772,7 @@ class Tee:
 
 def main() -> None:
     ensure_dirs()
+    load_persisted_sessions()  # 恢复重启前的登录会话，监控无需重新登录
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
