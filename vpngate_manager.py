@@ -113,6 +113,10 @@ MIRROR_META_URL = os.environ.get(
 API_URL = API_HTTPS_URL
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
+# How often the hot-standby tunnel gets a real egress probe (not just
+# process-alive + device-present). Catches a standby whose upstream node died
+# after the tunnel was built, so a failover never targets a dead tunnel.
+STANDBY_EGRESS_CHECK_INTERVAL_S = env_int("STANDBY_EGRESS_CHECK_INTERVAL_S", 300, 1)
 # Write-behind interval for the in-memory UI state cache (see set_state).
 # state.json is rewritten from scratch on every startup, so a few seconds of
 # staleness on crash is harmless; 5s bounds it while batching hot-path writes.
@@ -6963,13 +6967,45 @@ def active_node_pinger() -> None:
         time.sleep(10)
 
 
+def _verify_standby_egress(dev: str, node_id: str) -> None:
+    """Background egress probe for the standby tunnel; rebuild on failure.
+
+    standby_healthy() is cheap (process-alive + device-present, no I/O), so a
+    tunnel whose upstream node died after build still looks healthy. This runs
+    a real curl egress test through the standby device; on failure the standby
+    is torn down and standby_monitor_loop rebuilds it fresh.
+
+    Race guard: if a failover promoted this standby mid-probe, the globals no
+    longer match what we probed -- abort instead of tearing down the new
+    standby. Worst case the teardown only ever touches standby globals, never
+    the serving tunnel.
+    """
+    try:
+        if check_tunnel_health(dev):
+            return
+        with lock:
+            if standby_tun_dev != dev or standby_openvpn_node_id != node_id:
+                return
+        msg = f"[热备] 热备隧道 {dev} ({node_id}) 出口检测失败，拆除重建"
+        print(msg, flush=True)
+        log_to_json("WARNING", "VPN", msg)
+        stop_standby_openvpn()
+    except Exception as e:
+        print(f"[热备] 热备出口巡检异常: {e}", flush=True)
+
+
 def standby_monitor_loop() -> None:
     """Keep the hot-standby tunnel alive: rebuild it when missing or dead.
 
     Runs every 20s. ensure_standby_connection() is idempotent and guards
     against concurrent builds / manual connections, so this loop stays dumb.
+
+    Every STANDBY_EGRESS_CHECK_INTERVAL_S the standby also gets a real egress
+    probe (in a background thread so the 20s cadence never stalls): a tunnel
+    that is up but can't pass traffic is torn down and rebuilt fresh.
     """
     global last_standby_monitor_heartbeat
+    last_egress_check = 0.0
     while True:
         last_standby_monitor_heartbeat = time.time()
         try:
@@ -6983,6 +7019,22 @@ def standby_monitor_loop() -> None:
                     threading.Thread(
                         target=ensure_standby_connection,
                         name="vpngate-standby-monitor",
+                        daemon=True,
+                    ).start()
+            now = time.time()
+            if (
+                hot_standby_allowed()
+                and now - last_egress_check >= STANDBY_EGRESS_CHECK_INTERVAL_S
+            ):
+                last_egress_check = now
+                with lock:
+                    dev = standby_tun_dev
+                    node_id = standby_openvpn_node_id
+                if dev and node_id and standby_healthy():
+                    threading.Thread(
+                        target=_verify_standby_egress,
+                        args=(dev, node_id),
+                        name="vpngate-standby-egress-check",
                         daemon=True,
                     ).start()
         except Exception as e:

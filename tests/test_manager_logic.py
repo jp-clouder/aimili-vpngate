@@ -1472,6 +1472,50 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
             manager.standby_tun_dev = old_dev
 
 
+    def test_verify_standby_egress_tears_down_dead_tunnel(self) -> None:
+        """出口不通的热备隧道应被拆除重建，而不是留着等切换时空切。"""
+        old_dev, old_id = manager.standby_tun_dev, manager.standby_openvpn_node_id
+        manager.standby_tun_dev = "tun1"
+        manager.standby_openvpn_node_id = "node-dead"
+        try:
+            with mock.patch.object(manager, "check_tunnel_health", return_value=False), \
+                 mock.patch.object(manager, "stop_standby_openvpn") as stop_mock:
+                manager._verify_standby_egress("tun1", "node-dead")
+            stop_mock.assert_called_once()
+        finally:
+            manager.standby_tun_dev = old_dev
+            manager.standby_openvpn_node_id = old_id
+
+    def test_verify_standby_egress_keeps_healthy_tunnel(self) -> None:
+        """出口正常的热备隧道不应被动。"""
+        old_dev, old_id = manager.standby_tun_dev, manager.standby_openvpn_node_id
+        manager.standby_tun_dev = "tun1"
+        manager.standby_openvpn_node_id = "node-ok"
+        try:
+            with mock.patch.object(manager, "check_tunnel_health", return_value=True), \
+                 mock.patch.object(manager, "stop_standby_openvpn") as stop_mock:
+                manager._verify_standby_egress("tun1", "node-ok")
+            stop_mock.assert_not_called()
+        finally:
+            manager.standby_tun_dev = old_dev
+            manager.standby_openvpn_node_id = old_id
+
+    def test_verify_standby_egress_aborts_after_failover(self) -> None:
+        """巡检期间若发生故障切换（热备已转正），不得拆除新的热备。"""
+        old_dev, old_id = manager.standby_tun_dev, manager.standby_openvpn_node_id
+        # 模拟巡检开始后发生了切换：standby 全局变量已变更
+        manager.standby_tun_dev = "tun0"
+        manager.standby_openvpn_node_id = ""
+        try:
+            with mock.patch.object(manager, "check_tunnel_health", return_value=False), \
+                 mock.patch.object(manager, "stop_standby_openvpn") as stop_mock:
+                manager._verify_standby_egress("tun1", "node-old")
+            stop_mock.assert_not_called()
+        finally:
+            manager.standby_tun_dev = old_dev
+            manager.standby_openvpn_node_id = old_id
+
+
     def test_hot_standby_allowed_respects_ui_toggle(self) -> None:
         with mock.patch.object(
             manager, "load_ui_config", return_value={"hot_standby_enabled": False}
