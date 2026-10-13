@@ -591,6 +591,22 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("tun0", manager.active_tun_dev)
         self.assertEqual("tun0", manager.vpn_utils.get_active_tun_dev())
 
+    def test_hot_failover_or_cold_switch_prefers_hot(self) -> None:
+        """热备健康时优先无感切换，不走冷切。"""
+        with mock.patch.object(manager, "try_hot_failover", return_value=True) as hf_mock, \
+             mock.patch.object(manager, "auto_switch_node") as cold_mock:
+            manager.hot_failover_or_cold_switch("test-reason")
+        hf_mock.assert_called_once_with("test-reason")
+        cold_mock.assert_not_called()
+
+    def test_hot_failover_or_cold_switch_falls_back_to_cold(self) -> None:
+        """热备不可用时回落到冷切，行为与原来一致。"""
+        with mock.patch.object(manager, "try_hot_failover", return_value=False) as hf_mock, \
+             mock.patch.object(manager, "auto_switch_node") as cold_mock:
+            manager.hot_failover_or_cold_switch("test-reason")
+        hf_mock.assert_called_once_with("test-reason")
+        cold_mock.assert_called_once_with()
+
     def test_ensure_standby_skips_when_hot_standby_disabled(self) -> None:
         with mock.patch.object(manager, "HOT_STANDBY_ENABLED", False):
             with mock.patch.object(manager, "connect_standby_node") as build_mock:

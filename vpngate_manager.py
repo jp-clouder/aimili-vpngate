@@ -2090,6 +2090,19 @@ def try_hot_failover(reason: str) -> bool:
     threading.Thread(target=ensure_standby_connection, name="vpngate-standby-rebuild", daemon=True).start()
     return True
 
+
+def hot_failover_or_cold_switch(reason: str) -> None:
+    """Prefer hot failover; fall back to cold auto-switch.
+
+    Single choke point for "active tunnel died" handling so every path
+    (maintenance thread, refresh fast-connect, end-of-cycle diagnostic)
+    tries the seamless hot failover first. try_hot_failover() returns False
+    when hot standby is disabled or the standby is unhealthy, in which case
+    behavior is exactly the old cold switch.
+    """
+    if not try_hot_failover(reason):
+        auto_switch_node()
+
 def connection_ready_for_ui(state: dict[str, Any] | None = None) -> bool:
     current = get_state() if state is None else state
     return bool(
@@ -3023,8 +3036,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
-                        if not try_hot_failover("维护线程检测到 OpenVPN 进程意外退出"):
-                            auto_switch_node()
+                        hot_failover_or_cold_switch("维护线程检测到 OpenVPN 进程意外退出")
                         is_connecting = True
 
         try:
@@ -3111,7 +3123,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if available_candidates:
                     is_connecting = False
                     set_state(is_connecting=False, last_check_message="快速首连已找到可用节点，正在建立连接...")
-                    auto_switch_node()
+                    hot_failover_or_cold_switch("刷新周期快速首连检测到主隧道已死")
                     if active_openvpn_running():
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
                         message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
@@ -3183,7 +3195,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         available_candidates = apply_routing_filters(available_candidates, ui_cfg)
                         
                         if available_candidates:
-                            auto_switch_node()
+                            hot_failover_or_cold_switch("刷新周期诊断检测到主隧道进程已死")
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         total_tested = len(fast_results) + len(tested_results)
