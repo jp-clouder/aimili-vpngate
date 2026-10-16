@@ -1378,6 +1378,70 @@ class ManagerLogicTests(unittest.TestCase):
         logged = " ".join(str(call.args) for call in log_mock.call_args_list)
         self.assertIn("策略路由", logged)
 
+    def test_standby_build_failure_blacklists_node(self) -> None:
+        # Regression (10-15 log): without a cooldown the builder retried
+        # one dead node 345 times in 5.5 hours. A failed build must put
+        # the node on the blacklist so the next round picks another one.
+        nodes = self.write_nodes(2)
+        standby_id = nodes[1]["id"]
+
+        with (
+            mock.patch.object(manager, "hot_standby_allowed", return_value=True),
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(False, "handshake failed", None),
+            ),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            self.assertFalse(manager.connect_standby_node(standby_id))
+
+        self.assertIn(standby_id, manager.load_blacklist())
+
+    def test_standby_egress_failure_blacklists_node(self) -> None:
+        nodes = self.write_nodes(2)
+        standby_id = nodes[1]["id"]
+
+        with (
+            mock.patch.object(manager, "hot_standby_allowed", return_value=True),
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(True, "", FakeProcess()),
+            ),
+            mock.patch.object(manager, "setup_policy_routing", return_value=True),
+            mock.patch.object(manager, "check_tunnel_health", return_value=False),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            self.assertFalse(manager.connect_standby_node(standby_id))
+
+        self.assertIn(standby_id, manager.load_blacklist())
+
+    def test_auto_switch_skips_blacklisted_nodes(self) -> None:
+        # Regression (10-16 07:30): auto-switch picked a node that had
+        # just failed twice as a standby build. Blacklisted nodes must
+        # not be switch candidates.
+        nodes = self.write_nodes(3)
+        dead_id = nodes[0]["id"]
+        good_id = nodes[1]["id"]
+        for n in nodes:
+            n["probe_status"] = "available"
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.mark_blacklisted(nodes[0], "test failure")
+
+        with (
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(manager, "log_to_json"),
+            mock.patch.object(
+                manager, "connect_node", return_value="connected"
+            ) as connect_mock,
+        ):
+            manager.auto_switch_node()
+
+        connect_mock.assert_called_once_with(good_id)
+
     def test_standby_build_primary_gone_is_logged(self) -> None:
         nodes = self.write_nodes(2)
         standby_id = nodes[1]["id"]

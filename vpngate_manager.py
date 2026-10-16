@@ -1914,6 +1914,10 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
         if not ok or process is None:
             print(f"[热备] 热备隧道建立失败 ({node_id}): {message}", flush=True)
             log_to_json("WARNING", "VPN", f"热备隧道建立失败 ({node_id}): {message}")
+            # Cooldown: don't keep retrying a node that just failed to
+            # connect — without this the builder hammers the same dead
+            # node hundreds of times (10-15: 345 retries of one node).
+            mark_blacklisted(node, f"热备构建失败: {message}")
             try:
                 if config_path.exists():
                     config_path.unlink()
@@ -1924,12 +1928,14 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
         if not setup_policy_routing(standby_tun_dev):
             print(f"[热备] 热备隧道策略路由设置失败 ({node_id})，已放弃", flush=True)
             log_to_json("WARNING", "VPN", f"热备隧道策略路由设置失败 ({node_id})，已放弃")
+            mark_blacklisted(node, "热备策略路由设置失败")
             stop_process(process)
             return False
 
         if not check_tunnel_health(standby_tun_dev):
             print(f"[热备] 热备隧道 {standby_tun_dev} 建连成功但出口检测失败，已放弃", flush=True)
             log_to_json("WARNING", "VPN", f"热备隧道 {standby_tun_dev} 出口检测失败，已放弃")
+            mark_blacklisted(node, "热备出口检测失败")
             stop_process(process)
             return False
 
@@ -1998,10 +2004,12 @@ def ensure_standby_connection() -> None:
         with lock:
             nodes = read_nodes()
             primary_id = active_openvpn_node_id
+            blacklist = load_blacklist()
             candidates = [
                 n for n in nodes
                 if n.get("probe_status") == "available"
                 and n.get("id") != primary_id
+                and n.get("id") not in blacklist
                 and not n.get("active")
                 and not n.get("standby")
             ]
@@ -2644,9 +2652,11 @@ def auto_switch_node(attempt: int = 0) -> None:
     # Find the next best available node
     with lock:
         nodes = read_nodes()
+        blacklist = load_blacklist()
         candidates = [
             n for n in nodes
             if n.get("probe_status") == "available"
+            and n.get("id") not in blacklist
             and not n.get("active")
             and not n.get("standby")
         ]
