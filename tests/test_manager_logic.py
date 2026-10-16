@@ -1322,6 +1322,85 @@ class ManagerLogicTests(unittest.TestCase):
             manager.standby_openvpn_process = None
             manager.standby_openvpn_node_id = ""
 
+    def test_periodic_probe_excludes_standby_node(self) -> None:
+        # Regression: the periodic probe must not open a second OpenVPN
+        # session to the node the hot standby is already using — the
+        # server may kick one of the duplicate sessions.
+        nodes = self.write_nodes(4)
+        nodes[0]["active"] = True
+        nodes[1]["standby"] = True
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.active_openvpn_node_id = nodes[0]["id"]
+        # The merge rebuilds the standby marker from the live process.
+        manager.standby_openvpn_node_id = nodes[1]["id"]
+        manager.standby_openvpn_process = FakeProcess()
+
+        captured_ids: list[str] = []
+
+        def fake_test_multiple(ids, **kwargs):
+            captured_ids.extend(ids)
+            return []
+
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=nodes),
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test_multiple),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            manager.maintain_valid_nodes()
+
+        self.assertNotIn(nodes[1]["id"], captured_ids)
+        self.assertIn(nodes[2]["id"], captured_ids)
+        self.assertIn(nodes[3]["id"], captured_ids)
+        manager.standby_openvpn_node_id = ""
+        manager.standby_openvpn_process = None
+
+    def test_standby_build_policy_routing_failure_is_logged(self) -> None:
+        # Regression: every standby build failure path must leave a
+        # log_to_json trail — print-only failures are invisible in the
+        # on-disk JSON logs.
+        nodes = self.write_nodes(2)
+        standby_id = nodes[1]["id"]
+
+        with (
+            mock.patch.object(manager, "hot_standby_allowed", return_value=True),
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(True, "", FakeProcess()),
+            ),
+            mock.patch.object(manager, "setup_policy_routing", return_value=False),
+            mock.patch.object(manager, "log_to_json") as log_mock,
+        ):
+            self.assertFalse(manager.connect_standby_node(standby_id))
+
+        logged = " ".join(str(call.args) for call in log_mock.call_args_list)
+        self.assertIn("策略路由", logged)
+
+    def test_standby_build_primary_gone_is_logged(self) -> None:
+        nodes = self.write_nodes(2)
+        standby_id = nodes[1]["id"]
+
+        with (
+            mock.patch.object(manager, "hot_standby_allowed", return_value=True),
+            mock.patch.object(manager, "load_ui_config", return_value={}),
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(True, "", FakeProcess()),
+            ),
+            mock.patch.object(manager, "setup_policy_routing", return_value=True),
+            mock.patch.object(manager, "check_tunnel_health", return_value=True),
+            # Primary dies while the standby is being built.
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "log_to_json") as log_mock,
+        ):
+            self.assertFalse(manager.connect_standby_node(standby_id))
+
+        logged = " ".join(str(call.args) for call in log_mock.call_args_list)
+        self.assertIn("主隧道已消失", logged)
+
 class ProxyServerConcurrencyTests(unittest.TestCase):
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
         class Client:
@@ -1552,5 +1631,6 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
             mock.patch.object(manager, "HOT_STANDBY_ENABLED", False),
         ):
             self.assertFalse(manager.hot_standby_allowed())
+
 if __name__ == "__main__":
     unittest.main()

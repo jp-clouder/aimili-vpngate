@@ -1896,6 +1896,7 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
             config_path.write_text(node.get("config_text") or "", encoding="utf-8")
         except Exception as e:
             print(f"[热备] 写入热备节点配置失败: {e}", flush=True)
+            log_to_json("WARNING", "VPN", f"写入热备节点配置失败 ({node_id}): {e}")
             return False
 
         if cancel_event is not None and cancel_event.is_set():
@@ -1921,6 +1922,8 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
             return False
 
         if not setup_policy_routing(standby_tun_dev):
+            print(f"[热备] 热备隧道策略路由设置失败 ({node_id})，已放弃", flush=True)
+            log_to_json("WARNING", "VPN", f"热备隧道策略路由设置失败 ({node_id})，已放弃")
             stop_process(process)
             return False
 
@@ -1937,6 +1940,8 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
         if cancelled or primary_gone:
             # Manual disconnect/switch tore the primary down while we were
             # building: don't orphan a standby with no primary to back up.
+            print(f"[热备] 热备构建中主隧道已消失/已取消 ({node_id})，已放弃", flush=True)
+            log_to_json("WARNING", "VPN", f"热备构建中主隧道已消失/已取消 ({node_id})，已放弃")
             stop_process(process)
             return False
         if race_lost:
@@ -1956,6 +1961,7 @@ def connect_standby_node(node_id: str, cancel_event: threading.Event | None = No
         return True
     except Exception as exc:
         print(f"[热备] 热备构建异常: {exc}", flush=True)
+        log_to_json("WARNING", "VPN", f"热备构建异常 ({node_id}): {exc}")
         return False
 
 def ensure_standby_connection() -> None:
@@ -3148,7 +3154,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 current_nodes = read_nodes()
                 to_test = [
                     n for n in current_nodes
-                    if not n.get("active") and n.get("id") not in initial_tested_ids
+                    if not n.get("active") and not n.get("standby") and n.get("id") not in initial_tested_ids
                 ]
                 to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
                 to_test.sort(key=probe_priority_key)
