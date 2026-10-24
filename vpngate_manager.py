@@ -2984,22 +2984,20 @@ def merge_fresh_candidates(
         if cand["id"] not in seen_ids:
             previous = current_by_id.get(str(cand["id"]))
             if previous:
-                for key in [
+                # Probe results plus the full IP-enrichment field set.
+                # Use the IP_ENRICHMENT_FIELDS constant rather than a
+                # hand-copied list: the hand list once dropped
+                # ip_type_confidence / ip_type_sources, which silently
+                # emptied the residential routing filter after an update
+                # (nodes kept ip_type but lost the confidence the filter
+                # requires), leaving the client unable to auto-connect.
+                for key in (
                     "probe_status",
                     "probe_message",
                     "latency_ms",
                     "probed_at",
-                    "owner",
-                    "asn",
-                    "as_name",
-                    "location",
-                    "ip_type",
-                    "quality",
-                    "is_proxy",
-                    "is_hosting",
-                    "is_mobile",
-                    "ip_type_reason",
-                ]:
+                    *IP_ENRICHMENT_FIELDS,
+                ):
                     if previous.get(key) not in (None, ""):
                         cand[key] = previous.get(key)
             merged.append(cand)

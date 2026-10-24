@@ -1589,6 +1589,39 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
             manager.standby_openvpn_node_id = old_id
             manager.active_openvpn_node_id = old_active
 
+    def test_merge_preserves_full_ip_enrichment_fields(self) -> None:
+        """Regression (2026-10-24, US VPS): the merge carry-over list was
+        hand-copied and dropped ip_type_confidence / ip_type_sources, so
+        after the first refresh post-update every node lost its confidence
+        and the residential routing filter (which requires confidence
+        medium/high) rejected all candidates — no auto-connect. The merge
+        must carry over every IP_ENRICHMENT_FIELDS entry."""
+        old_proc, old_id = (
+            manager.standby_openvpn_process,
+            manager.standby_openvpn_node_id,
+        )
+        manager.standby_openvpn_process = None
+        manager.standby_openvpn_node_id = ""
+        try:
+            previous = {"id": "node-a", "probe_status": "available"}
+            for field in manager.IP_ENRICHMENT_FIELDS:
+                previous[field] = f"prev-{field}"
+            current = [previous]
+            candidates = [{"id": "node-a", "config_file": "/tmp/x", "ping": 10}]
+            with manager.lock:
+                merged = manager.merge_fresh_candidates(current, candidates)
+            node = next(n for n in merged if n["id"] == "node-a")
+            for field in manager.IP_ENRICHMENT_FIELDS:
+                self.assertEqual(f"prev-{field}", node.get(field), field)
+            # And the enriched node must pass the residential filter.
+            ui_cfg = {"routing_mode": "auto", "routing_ip_type": "residential"}
+            node["ip_type"] = "residential"
+            node["ip_type_confidence"] = "high"
+            self.assertEqual([node], manager.apply_routing_filters([node], ui_cfg))
+        finally:
+            manager.standby_openvpn_process = old_proc
+            manager.standby_openvpn_node_id = old_id
+
     def test_merge_clears_standby_marker_when_no_live_standby(self) -> None:
         old_proc, old_id = (
             manager.standby_openvpn_process,
